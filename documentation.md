@@ -29,6 +29,37 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-03 — Phase 3 complete: open image (dialog, decode, one-page canvas)
+
+**Context:**
+
+Phase 3 of `plan.md` §24: native file dialog → image load → one-page document → canvas renderer. "Open JPG/PNG and see it inside Mark."
+
+**Actions:**
+
+- `platform` (was a stub): `FilePicker` trait with `pick_open_document()` + `NativeFileDialogs` via rfd 0.17 `AsyncFileDialog` (default features = `xdg-portal` + `wayland`, no GTK; plan.md §9.1). Filter: pdf, png, jpg/jpeg, webp. Dialog future awaited on GPUI's foreground executor — viable because rfd's portal backend is runtime-agnostic (rfd's own sync API blocks the same future with pollster).
+- `mark-image` (was a stub): `ImageDocument::load(path)` decodes via `image::ImageReader` → RGBA8, wraps it as a one-page `Document` (`DocumentSource::Image`). **Page size: 1 px = 1 pt** (72 dpi logical units, plan.md §8). `LoadImageError` (Io/Decode) via thiserror 2.
+- `app`: `OpenState` machine (Empty → Opening → Opened/Failed) with explicit async states per the gpui-kit coding guides. Ctrl+O and a new "Open…" button (gpui-omarchy `button`, Outline variant) both dispatch `open_with_dialog`; decode runs via `background_executor().spawn`, result applied on the foreground. `mark <file>` CLI argument opens directly (bypasses the dialog — also the smoke-test entry). Header shows the open file's name. New `canvas.rs`: RGBA→BGRA channel swap into `gpui_kit::RenderImage` (`[Frame; 1]` avoids a smallvec dep), page drawn with `img()` — intrinsic aspect ratio is automatic, `max_w_full/max_h_full` contain big images; border + shadow from theme tokens.
+- Failure copy per plan.md §17: "Could not open <name>." + "The file may be damaged or in an unsupported format." — no raw errors.
+
+**Decisions:**
+
+- rfd 0.17 (not gtk3 feature) — portal backend is the Omarchy-correct path and default.
+- `async fn` in the `FilePicker` trait with a scoped `#[allow(async_fn_in_trait)]`: internal seam, never `dyn`, no auto-trait bounds needed (rustc's AFIT lint and clippy's `manual_async_fn` pull opposite ways; the allow is the documented resolution).
+- BGRA conversion lives in the app (Layer A), not mark-image: BGRA is a GPUI render-surface detail, not a domain one.
+- Zoom/pan deferred to Phase 5 as planned; Phase 3 shows native pixel size (small images) or contained fit (large images).
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 23 passed (5 new in mark-image: PNG/JPEG/WebP load + geometry + alpha normalization, missing file → Io, non-image → Decode).
+- Native rendering verified with screenshots (grim): 640×400 quadrant PNG (R/G/B/Y + black cross) rendered centered, aspect exact, at native size; error state (`mark bad.txt`) shows the failure notice and the app stays alive; empty launch regression OK (exit 124 at timeout kill).
+
+**Next:**
+
+1. Phase 4: PDFium worker thread (§6.4), PDF load + render, `PageCoordinateMapper` + full §8.1 fixture suite.
+2. Native manual check of the real Ctrl+O portal dialog on Omarchy (can't be automated; opening via CLI arg covers the load path).
+
 ### 2026-10-03 — Phase 2 complete: domain model, command/undo framework, CI matrix
 
 **Context:**

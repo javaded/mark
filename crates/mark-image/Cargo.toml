@@ -7,3 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+mark-core.workspace = true
+image.workspace = true
+thiserror.workspace = true
