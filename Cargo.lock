@@ -3147,6 +3147,7 @@ dependencies = [
  "qoi",
  "ravif",
  "rayon",
+ "rgb",
  "tiff",
  "zune-core",
  "zune-jpeg",
@@ -3679,6 +3680,10 @@ version = "0.1.0"
 dependencies = [
  "gpui-kit",
  "gpui-omarchy",
+ "image",
+ "mark-core",
+ "mark-image",
+ "platform",
 ]
 
 [[package]]
@@ -3695,6 +3700,11 @@ version = "0.1.0"
 [[package]]
 name = "mark-image"
 version = "0.1.0"
+dependencies = [
+ "image",
+ "mark-core",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "mark-pdf"
@@ -4831,6 +4841,9 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "platform"
 version = "0.1.0"
+dependencies = [
+ "rfd",
+]
 
 [[package]]
 name = "png"
@@ -5460,6 +5473,33 @@ dependencies = [
  "tiny-skia",
  "usvg",
  "zune-jpeg",
+]
+
+[[package]]
+name = "rfd"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20dafead71c16a34e1ff357ddefc8afc11e7d51d6d2b9fbd07eaa48e3e540220"
+dependencies = [
+ "block2 0.6.2",
+ "dispatch2",
+ "js-sys",
+ "libc",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "percent-encoding",
+ "pollster 0.4.0",
+ "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "web-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

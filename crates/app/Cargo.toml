@@ -13,3 +13,7 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit.workspace = true
 gpui-omarchy.workspace = true
+mark-core.workspace = true
+mark-image.workspace = true
+platform.workspace = true
+image.workspace = true

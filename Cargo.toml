@@ -36,3 +36,7 @@ image = "0.25"
 
 # Domain
 uuid = { version = "1", features = ["v4"] }
+
+# Platform & errors (plan.md §21)
+rfd = "0.17"
+thiserror = "2"

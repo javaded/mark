@@ -1,6 +1,9 @@
 //! Mark — desktop document signer (application shell).
 
 mod app;
+mod canvas;
+
+use std::path::PathBuf;
 
 use app::MarkApp;
 use gpui_kit::{
@@ -11,6 +14,9 @@ use gpui_kit::{
 gpui_kit::actions!(mark, [Quit, OpenDocument]);
 
 fn main() {
+    // Optional file argument: `mark picture.png` opens it directly, no dialog.
+    let open_path = std::env::args().nth(1).map(PathBuf::from);
+
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
@@ -34,7 +40,15 @@ fn main() {
             gpui_kit::open_window(
                 window_options(SharedString::from("Mark"), cx),
                 cx,
-                |_, cx| cx.new(|_| MarkApp::default()),
+                |_, cx| {
+                    cx.new(|cx| {
+                        let mut app = MarkApp::new();
+                        if let Some(path) = open_path {
+                            app.open_path(path, cx);
+                        }
+                        app
+                    })
+                },
             )
             .expect("failed to open window");
 
