@@ -1,0 +1,10 @@
+[package]
+name = "mark-pdf"
+description = "PDF document engine for Mark — PDFium via pdfium-render."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pdfium-render.workspace = true

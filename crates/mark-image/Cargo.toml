@@ -1,0 +1,9 @@
+[package]
+name = "mark-image"
+description = "Raster image document engine for Mark."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
