@@ -41,7 +41,7 @@ Phase 2 of `plan.md` §24: `Document`, `Page`, `ImageObject`, `Asset`, `Document
 - Repairs: `entity_id!` macro invocations in `ids.rs` passed string literals where `#[doc]` meta was expected (converted to doc comments); `DuplicateObject::new` had a useless `mut` and an irrefutable `if let` on the single-variant `ObjectKind` (kept the match for the planned Text/Shape variants, `#[allow(irrefutable_let_patterns)]`); removed dead `Document::page_index`; fixed two test-authoring bugs (`duplicate_gets_fresh_id_and_offset_on_same_page` added a different fresh-id object than its `source_id` referenced, so the duplicate silently no-opped; `new_command_invalidates_redo_history` asserted `can_redo()` without ever undoing — added the `undo()` and asserted `next_redo_description` instead).
 - `mark-core` contents: `ids` (UUID newtypes `PageId`/`ObjectId`/`AssetId`), `model` (`Vec2`, `Rect`, `PageRotation` 0/90/180/270, `ImageObject` centered-on-page ctor, `DocumentObject` id+kind, `Page`, `Document` with crate-private mutation surface so all changes flow through commands), `commands` (`AddObject`, `DeleteObject`, `MoveObject`, `MoveObjectToPage`, `DuplicateObject` offset +fresh id, `DuplicateToPage` preserving z-order on undo, `ResizeObject` aspect-locked, `RotateObject`, `SetOpacity`), `session` (`UndoManager` with redo-invalidation, `DocumentSession` generation-based dirty tracking), `transform` (`ViewTransform` for zoom/pan/fit).
 - Added `uuid = { version = "1", features = ["v4"] }` (workspace + mark-core) — sanctioned by plan.md §21 optional list.
-- CI live: `.github/workflows/ci.yml` — ubuntu-latest runs fmt + clippy `-D warnings` + check + test on the full workspace (installs GPUI Linux deps: xkbcommon, wayland, egl, gles via pkg-config); macos-latest and windows-latest run check + test on domain crates (`--exclude mark-app --exclude platform`). `Swatinem/rust-cache@v2`, `dtolnay/rust-toolchain@stable`.
+- CI live: `.github/workflows/ci.yml` — ubuntu-latest runs fmt + clippy `-D warnings` + check + test on the full workspace (installs GPUI Linux deps: pkg-config, xkbcommon + xkbcommon-x11, xcb1, wayland, egl, gles, fontconfig dev packages); macos-latest and windows-latest run check + test on domain crates (`--exclude mark-app --exclude platform`). `Swatinem/rust-cache@v2`, `dtolnay/rust-toolchain@stable`. Two fix iterations after the first run: fontconfig dev package (GPUI text stack probes it at build time), then xkbcommon-x11 + xcb1 (only test binaries link `-lxkbcommon-x11 -lxcb`; check/clippy don't link, so the gap surfaced at `cargo test`).
 
 **Decisions:**
 
@@ -56,12 +56,11 @@ Phase 2 of `plan.md` §24: `Document`, `Page`, `ImageObject`, `Asset`, `Document
 - `cargo clippy --workspace --all-targets -- -D warnings` — OK, zero warnings.
 - `cargo test --workspace --all-targets` — 18 passed (14 integration in mark-core `tests/model.rs`, 4 unit), 0 failed.
 - Native launch re-verified: `timeout 10s ./target/debug/mark` → exit 124 (alive at kill).
-- CI verified by pushing and watching the first matrix run (see Next).
+- CI verified end-to-end: run https://github.com/javaded/mark/actions/runs/37068312568 — all three jobs green (ubuntu 6m33s, macos 21s, windows 1m16s) after the two package fixes recorded above.
 
 **Next:**
 
 1. Phase 3 (open image): `rfd` in `platform`, image load, one-page document, canvas renderer.
-2. Watch the first CI run on all three OSes; fix apt set / exclusions if anything is off.
 
 ### 2026-10-03 — Phase 1 complete: GPUI application shell (retroactive entry)
 
