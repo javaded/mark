@@ -6,3 +6,8 @@
 
 # Rust backup files
 **/*.rs.bk
+
+# Duplicate agent-skill install targets (canonical copies: .agents/skills/)
+/agent/
+/.claude/
+
