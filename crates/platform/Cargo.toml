@@ -1,0 +1,9 @@
+[package]
+name = "platform"
+description = "Platform integration for Mark — file dialogs, app directories. The only crate with cfg(target_os)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

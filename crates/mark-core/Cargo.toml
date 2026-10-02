@@ -1,0 +1,9 @@
+[package]
+name = "mark-core"
+description = "Document domain model for Mark — pages, objects, assets, sessions. No GPUI, no PDFium."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

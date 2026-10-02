@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/app",
+    "crates/mark-core",
+    "crates/mark-export",
+    "crates/mark-image",
+    "crates/mark-pdf",
+    "crates/platform",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/javaded/mark"
+
+[workspace.dependencies]
+# Internal crates
+mark-core = { path = "crates/mark-core" }
+mark-export = { path = "crates/mark-export" }
+mark-image = { path = "crates/mark-image" }
+mark-pdf = { path = "crates/mark-pdf" }
+platform = { path = "crates/platform" }
+
+# UI — pinned per docs/architecture.md.
+# gpui-kit and gpui-omarchy upgrade ONLY in lockstep; never bump one alone.
+# `assets` (Lucide icon set) is required: gpui-omarchy components read SVGs
+# through the asset source. The styled `gpui-component` facade stays OFF.
+gpui-kit = { version = "=0.7.0", default-features = false, features = ["assets"] }
+gpui-omarchy = "0.2.0"
+
+# PDF engine — PDFium build 7881 via script/fetch-pdfium.sh
+pdfium-render = "0.9"
+image = "0.25"

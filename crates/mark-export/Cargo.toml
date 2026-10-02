@@ -1,0 +1,9 @@
+[package]
+name = "mark-export"
+description = "Export engine for Mark — writes signed documents without touching originals."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

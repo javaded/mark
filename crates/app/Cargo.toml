@@ -1,0 +1,15 @@
+[package]
+name = "mark-app"
+description = "Mark. Sign anything. Desktop document signer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mark"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit.workspace = true
+gpui-omarchy.workspace = true
