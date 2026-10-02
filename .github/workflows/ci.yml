@@ -19,12 +19,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # GPUI Linux backend links xkbcommon, wayland (client + egl) and EGL
-      # via pkg-config at build time (plan.md §20.5: ubuntu runs the full suite).
+      # GPUI Linux backend links xkbcommon, wayland (client + egl), EGL and
+      # fontconfig (text stack) via pkg-config at build time
+      # (plan.md §20.5: ubuntu runs the full suite).
       - name: Install GPUI system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgles2-mesa-dev libfontconfig1-dev
 
       - uses: Swatinem/rust-cache@v2
 
