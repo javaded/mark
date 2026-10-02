@@ -29,6 +29,66 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-03 — Phase 2 complete: domain model, command/undo framework, CI matrix
+
+**Context:**
+
+Phase 2 of `plan.md` §24: `Document`, `Page`, `ImageObject`, `Asset`, `DocumentSession`, command/undo skeleton with unit tests; CI matrix live. The previous session froze mid-phase — this session recovered, repaired, and finished it.
+
+**Actions:**
+
+- Recovered frozen working tree: all of `mark-core` was written but uncommitted and non-compiling.
+- Repairs: `entity_id!` macro invocations in `ids.rs` passed string literals where `#[doc]` meta was expected (converted to doc comments); `DuplicateObject::new` had a useless `mut` and an irrefutable `if let` on the single-variant `ObjectKind` (kept the match for the planned Text/Shape variants, `#[allow(irrefutable_let_patterns)]`); removed dead `Document::page_index`; fixed two test-authoring bugs (`duplicate_gets_fresh_id_and_offset_on_same_page` added a different fresh-id object than its `source_id` referenced, so the duplicate silently no-opped; `new_command_invalidates_redo_history` asserted `can_redo()` without ever undoing — added the `undo()` and asserted `next_redo_description` instead).
+- `mark-core` contents: `ids` (UUID newtypes `PageId`/`ObjectId`/`AssetId`), `model` (`Vec2`, `Rect`, `PageRotation` 0/90/180/270, `ImageObject` centered-on-page ctor, `DocumentObject` id+kind, `Page`, `Document` with crate-private mutation surface so all changes flow through commands), `commands` (`AddObject`, `DeleteObject`, `MoveObject`, `MoveObjectToPage`, `DuplicateObject` offset +fresh id, `DuplicateToPage` preserving z-order on undo, `ResizeObject` aspect-locked, `RotateObject`, `SetOpacity`), `session` (`UndoManager` with redo-invalidation, `DocumentSession` generation-based dirty tracking), `transform` (`ViewTransform` for zoom/pan/fit).
+- Added `uuid = { version = "1", features = ["v4"] }` (workspace + mark-core) — sanctioned by plan.md §21 optional list.
+- CI live: `.github/workflows/ci.yml` — ubuntu-latest runs fmt + clippy `-D warnings` + check + test on the full workspace (installs GPUI Linux deps: xkbcommon, wayland, egl, gles via pkg-config); macos-latest and windows-latest run check + test on domain crates (`--exclude mark-app --exclude platform`). `Swatinem/rust-cache@v2`, `dtolnay/rust-toolchain@stable`.
+
+**Decisions:**
+
+- Object mutation stays `pub(crate)` in `Document` — the command layer is the only writer (plan.md §14 enforced by visibility, not convention).
+- Dirty tracking via generation counter (execute +1, undo −1, save snapshots) instead of a bool, so undo-to-save-point returns to clean exactly.
+- CI domain set includes `mark-pdf` on mac/windows: pdfium-render binds at runtime, so it compiles without the binary; plan.md §20.5's "keep PDFium loading out of unit tests" keeps this true by construction.
+- `ObjectKind::Image` is currently the only variant; match arms stay exhaustive-ready for Text/Shape (plan.md §7).
+
+**Verification:**
+
+- `cargo fmt --check` — OK.
+- `cargo clippy --workspace --all-targets -- -D warnings` — OK, zero warnings.
+- `cargo test --workspace --all-targets` — 18 passed (14 integration in mark-core `tests/model.rs`, 4 unit), 0 failed.
+- Native launch re-verified: `timeout 10s ./target/debug/mark` → exit 124 (alive at kill).
+- CI verified by pushing and watching the first matrix run (see Next).
+
+**Next:**
+
+1. Phase 3 (open image): `rfd` in `platform`, image load, one-page document, canvas renderer.
+2. Watch the first CI run on all three OSes; fix apt set / exclusions if anything is off.
+
+### 2026-10-03 — Phase 1 complete: GPUI application shell (retroactive entry)
+
+**Context:**
+
+Phase 1 of `plan.md` §24: window + header + empty workspace. Committed as `06 app-shell` in the previous session, but the system froze before this log entry and the push were written. Entry recorded now for audit completeness; facts verified against commit `aa5a90e` and a fresh launch.
+
+**Actions:**
+
+- `crates/app/src/main.rs`: `gpui_kit::application()` with assets, `gpui_omarchy::init(cx)` (theme following), keybindings Ctrl/Cmd-Q (Quit → `cx.quit()`) and Ctrl/Cmd-O (OpenDocument), window titled "Mark", min 780×540, default 1120×760 centered, via `gpui_kit::open_window` (Root-mounted for future overlays).
+- `crates/app/src/app.rs`: `focus_scope("mark")`, header bar (wordmark "Mark" + "Sign anything." tagline, bordered, themed), empty workspace (FileText icon, "No document open", live shortcut hint localized per-OS), OpenDocument action shows a Phase-3 placeholder status.
+
+**Decisions:**
+
+- Placeholder status text on Ctrl+O rather than a no-op or stub dialog — keeps the keybinding path real while Phase 3 delivers the file dialog.
+- Header zoom/export controls deferred to Phase 5+ (nothing to zoom yet).
+
+**Verification:**
+
+- Commit-time (previous session): fmt/clippy/test all green per repo validation set.
+- This session: rebuilt and launched `timeout 10s ./target/debug/mark` → exit 124 (window alive at kill), no panic.
+
+**Next:**
+
+1. Phase 2 (this entry's successor above).
+2. Push commit `06` together with Phase 2 work (freeze had left `main` ahead of `origin/main` by one).
+
 ### 2026-10-03 — Phase 0 complete: repo, skills, PDFium runtime, workspace bootstrap
 
 **Context:**

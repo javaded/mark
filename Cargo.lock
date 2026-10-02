@@ -3684,6 +3684,9 @@ dependencies = [
 [[package]]
 name = "mark-core"
 version = "0.1.0"
+dependencies = [
+ "uuid",
+]
 
 [[package]]
 name = "mark-export"
