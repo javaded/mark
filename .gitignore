@@ -1,0 +1,8 @@
+# Build artifacts
+/target
+
+# PDFium binaries fetched by script/fetch-pdfium.sh
+/vendor
+
+# Rust backup files
+**/*.rs.bk
