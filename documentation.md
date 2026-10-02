@@ -29,6 +29,49 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-03 — Phase 0 complete: repo, skills, PDFium runtime, workspace bootstrap
+
+**Context:**
+
+Phase 0 of `plan.md` §24: bootstrap and reconnaissance before any product code.
+
+**Actions:**
+
+- Created private GitHub repo **https://github.com/javaded/mark** (`gh repo create mark --private`), branch `main`, first commit `01 bootstrap: project plan and documentation` (plan.md, documentation.md, README.md, .gitignore).
+- Environment verified: git 2.55, gh authenticated as `javaded`, rustc/cargo 1.98.1, node 26.7.0, clang 22.1.8, `xkbcommon`/`wayland-client`/`wayland-egl`/`egl` pkg-config entries all present on Omarchy x86_64.
+- Reconnaissance on shallow clones in `/tmp/opencode/recon/`:
+  - `gpui-kit` 0.7.0 is built on `gpui-pre =0.3.7` snapshot crates (workspace `Cargo.toml` line 69).
+  - `gpui-omarchy` `Cargo.toml` line 11 declares `gpui-kit = { version = "=0.7.0", default-features = false, features = ["assets"] }` — **the `assets` feature arrives transitively**; our workspace declares it explicitly.
+  - `gpui_omarchy::init(cx)` already calls `gpui_kit::base::init` + focus/popover/button-group/date-picker init + `Theme::follow_system`; no separate `gpui_kit::init` call needed.
+  - `gpui_kit::open_window` mounts the base `Root` (needed for future sheets/popovers/toasts) — used instead of raw `cx.open_window`.
+  - Read `gpui-kit/examples/ai_recipes/README.md` and `src/bootstrap.rs` (tested consumer recipe), `gpui-omarchy/examples/hello.rs`, `gpui-omarchy/AGENTS.md`.
+- Installed agent skills into `.agents/skills/` and `.claude/skills/`: `gpui-kit`, `gpui-kit-design-guides` (via `npx skills add longbridge/gpui-kit --agent '*' -y`) and `omarchy-style` (copied from the gpui-omarchy repo).
+- Wrote `script/fetch-pdfium.sh` (platform/arch detection incl. musl, `PDFIUM_VERSION`/`PDFIUM_PLATFORM` overrides, downloads from `bblanchon/pdfium-binaries` tag `chromium/7881` into gitignored `vendor/pdfium/<platform>/`). Verified: `libpdfium.so` extracted (3.5 MB archive, 8 MB tree).
+- Created Cargo workspace skeleton (6 crates): `mark-app` (bin `mark`, GPUI window), `mark-core`, `mark-pdf`, `mark-image`, `mark-export`, `platform` (all doc-stub libs at this phase), plus `resources/` and `docs/architecture.md`.
+- One API fix during bootstrap: dropped `.id()` on the root div (needs `InteractiveElement` import, unnecessary for a non-interactive root) and replaced non-existent `pdfium.get_pdfium_version()` with a real `create_new_pdf()` call as the binding check.
+
+**Decisions:**
+
+- Pinned triple recorded in `docs/architecture.md`: `gpui-kit =0.7.0` (no default features, `assets` on) + `gpui-omarchy 0.2.0` + effective `gpui-pre 0.3.7`; lockstep rule documented.
+- PDFium runtime pinned to build **7881** (matches pdfium-render 0.9.4's `pdfium_latest`); `pdfium-render 0.9.4` + `image 0.25` aligned.
+- App bootstrap uses `gpui_kit::open_window` (Root mounting) — deviation from gpui-omarchy's simple `cx.open_window` examples, justified by upcoming overlay needs.
+- `vendor/` is gitignored; everyone (and CI) runs `script/fetch-pdfium.sh`.
+- Phase 0 scope extended slightly into Phase 1 territory (minimal GPUI window) to validate the full UI stack compiles and runs now rather than discovering pin problems later. Real layout still belongs to Phase 1.
+
+**Verification:**
+
+- `cargo fmt --check` — OK.
+- `cargo clippy --workspace --all-targets -- -D warnings` — OK, zero warnings.
+- `cargo test --workspace --all-targets` — OK (0 tests; stub crates, expected).
+- `cargo run -p mark-pdf --example check_bind` — "PDFium bound successfully (created empty document, 0 pages)" from `vendor/pdfium/linux-x64/lib`. Real FPDF call exercised, not just dlopen.
+- Native launch: `timeout 12s ./target/debug/mark` → exit 124 (killed by timeout while running) = window opened on Omarchy and stayed alive; no panic output. First full build ≈ 4m40s.
+
+**Next:**
+
+1. Phase 1 (GPUI application shell): header bar, empty workspace layout, window title "Mark", keyboard focus, close behavior; native Omarchy review.
+2. Phase 2 (domain model in `mark-core`) + CI matrix (ubuntu/macos/windows) per plan.md §20.5.
+3. Phase 3 will need `rfd` in `platform`.
+
 ### 2026-10-03 — Project founding: plan review, naming, planning documents
 
 **Context:**
