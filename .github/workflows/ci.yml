@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: ubuntu (fmt, clippy, check, test — full workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # GPUI Linux backend links xkbcommon, wayland (client + egl) and EGL
+      # via pkg-config at build time (plan.md §20.5: ubuntu runs the full suite).
+      - name: Install GPUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --all-targets
+
+  domain:
+    name: ${{ matrix.os }} (domain crates check + test)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Domain crates must build everywhere; UI/platform crates may lag
+      # (plan.md §20.5). PDFium binding is runtime-only, so mark-pdf
+      # compiles without the binary; unit tests never load it.
+      - run: cargo check --workspace --exclude mark-app --exclude platform --all-targets
+      - run: cargo test --workspace --exclude mark-app --exclude platform --all-targets

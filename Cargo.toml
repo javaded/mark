@@ -33,3 +33,6 @@ gpui-omarchy = "0.2.0"
 # PDF engine — PDFium build 7881 via script/fetch-pdfium.sh
 pdfium-render = "0.9"
 image = "0.25"
+
+# Domain
+uuid = { version = "1", features = ["v4"] }
