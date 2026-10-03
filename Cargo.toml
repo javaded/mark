@@ -40,3 +40,7 @@ uuid = { version = "1", features = ["v4"] }
 # Platform & errors (plan.md §21)
 rfd = "0.17"
 thiserror = "2"
+
+# Async seam for the PDFium worker (§6.4): awaitable oneshot replies
+# without coupling Layer C to a UI runtime. Already in the tree via gpui.
+futures-channel = "0.3"

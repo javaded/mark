@@ -10,7 +10,8 @@ fn main() {
     let dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(default_vendor_dir);
+        .or_else(mark_pdf::bind::vendor_lib_dir)
+        .unwrap_or_else(|| PathBuf::from("vendor/pdfium"));
 
     let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
         .or_else(|_| Pdfium::bind_to_system_library())
@@ -33,17 +34,4 @@ fn main() {
         document.pages().len()
     );
     println!("Library directory: {}", dir.display());
-}
-
-/// First `vendor/pdfium/<platform>/lib` directory created by fetch-pdfium.sh.
-fn default_vendor_dir() -> PathBuf {
-    if let Ok(platforms) = std::fs::read_dir("vendor/pdfium") {
-        for platform in platforms.flatten() {
-            let lib = platform.path().join("lib");
-            if lib.is_dir() {
-                return lib;
-            }
-        }
-    }
-    PathBuf::from("vendor/pdfium")
 }

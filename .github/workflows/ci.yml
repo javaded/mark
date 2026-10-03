@@ -29,6 +29,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Real PDFium runtime: mark-pdf integration tests bind to it; tests
+      # skip gracefully where it is absent (macos/windows domain jobs).
+      - name: Fetch PDFium runtime
+        run: ./script/fetch-pdfium.sh
+
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo check --workspace --all-targets

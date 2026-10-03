@@ -35,11 +35,18 @@ pub struct Page {
 
 impl Page {
     pub fn new(width: f32, height: f32) -> Self {
+        Self::with_rotation(width, height, PageRotation::None)
+    }
+
+    /// Creates a page with intrinsic PDF rotation metadata. `width`/`height`
+    /// are the dimensions *as displayed* (post-rotation), matching
+    /// [`crate::PageGeometry::display_size`].
+    pub fn with_rotation(width: f32, height: f32, rotation: PageRotation) -> Self {
         Self {
             id: PageId::new(),
             width,
             height,
-            rotation: PageRotation::None,
+            rotation,
             objects: Vec::new(),
         }
     }
@@ -254,6 +261,12 @@ pub struct Rect {
 pub struct Vec2 {
     pub x: f32,
     pub y: f32,
+}
+
+impl Vec2 {
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
 }
 
 /// The whole document: its source plus its pages.

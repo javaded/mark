@@ -3683,6 +3683,7 @@ dependencies = [
  "image",
  "mark-core",
  "mark-image",
+ "mark-pdf",
  "platform",
 ]
 
@@ -3710,7 +3711,12 @@ dependencies = [
 name = "mark-pdf"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "image",
+ "mark-core",
  "pdfium-render",
+ "pollster 0.4.0",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

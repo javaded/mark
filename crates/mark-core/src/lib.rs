@@ -11,6 +11,7 @@
 //! engine at export time.
 
 mod commands;
+mod coordinates;
 mod ids;
 mod model;
 mod session;
@@ -21,6 +22,7 @@ pub use commands::{
     AddObject, DeleteObject, DuplicateObject, DuplicateToPage, MoveObject, MoveObjectToPage,
     ResizeObject, RotateObject, SetOpacity,
 };
+pub use coordinates::{PageCoordinateMapper, PageGeometry};
 pub use ids::{AssetId, ObjectId, PageId};
 pub use model::{
     Asset, AssetKind, Document, DocumentObject, DocumentSource, ImageObject, ObjectKind, Page,
