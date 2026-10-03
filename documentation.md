@@ -29,6 +29,42 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-03 — Phase 4 complete: PDF engine — worker thread, load/render, coordinate fixtures
+
+**Context:**
+
+Phase 4 of `plan.md` §24: PDFium worker thread (§6.4), PDF load (page count/dimensions), render current page, and `PageCoordinateMapper` with the full §8.1 fixture suite — "the day PDF rendering lands", not at export time.
+
+**Actions:**
+
+- `mark-core` new `coordinates` module: `PageGeometry { origin, size, rotation }` (crop-box origin + unrotated size in PDF user space) and `PageCoordinateMapper` (`user_to_display`/`display_to_user`, top-left post-rotation display space). `Page::with_rotation` constructor (display sizes + rotation metadata); `Vec2::new`. New `tests/coordinates.rs`: exact corner mappings for /Rotate 0/90/180/270 on US Letter, A4 landscape, crop-box offsets, arbitrary/fractional sizes; user↔display round-trips over sizes × origins × rotations; full user→display→screen→display→user round-trips over zooms 50/100/300% and five pan states composed with `ViewTransform`.
+- `mark-pdf` (was a stub): `bind` (vendor dir → system fallback, mirrors `Pdfium::default()`; shared with `check_bind` example), `geometry` (crop→media fallback box extraction), `document` (`load_pdf` → live `PdfDocument` + domain `Document` with display sizes + `Vec<PageGeometry>`), `render` (`PdfRenderConfig::set_target_width`, RGBA via `as_image`, scale = px/point), `worker` — the §6.4 architecture: dedicated `mark-pdfium` thread owns the `Pdfium` instance and all open documents in a local `HashMap` (no self-referential struct), `std::sync::mpsc` for requests, `futures-channel` oneshot for awaitable replies; `PdfWorker::{load, render_page, close}`, `PdfDocumentHandle` opaque to the UI. No PDFium type crosses the crate API. `LoadPdfError`/`RenderPageError` via thiserror; missing runtime replies `RuntimeUnavailable` to every request instead of hanging (§9.4).
+- Fixtures: `examples/gen_fixtures.rs` hand-builds minimal PDFs with exact MediaBox/CropBox/Rotate and one colored quadrant per page in user space → `resources/test-documents/` (letter-portrait, a4-landscape, rotated-90, cropped, mixed-sizes). Regeneration: `cargo run -p mark-pdf --example gen_fixtures`.
+- `mark-pdf` tests (skip gracefully when no runtime, §20.5): document.rs — page counts, display/user geometry, rotation metadata, crop origin (61.2, 79.2), not-a-pdf error; render.rs — target-width aspect, scale, and quadrant pixel placement: letter red at display bottom-left, **rotated-90 red at display top-left** (pins that PDFium rendering honors /Rotate), cropped renders the crop box area, mixed pages render per page; worker.rs — load→render→close sequencing, distinct handles, close releases only that document, interleaved renders preserve correctness, unknown handle errors.
+- `app`: `open_path` routes by extension; PDFs load via `Arc<PdfWorker>` (spawned in `main`), the document shows immediately with a "Rendering page…" notice, then page 1 fills in when the worker replies (target width 2× points clamped 800–2400 until Phase 5 zoom, §11). Opening another document closes the previous worker-side handle. Failure copy unchanged (§17). Image flow untouched.
+- CI: ubuntu job runs `script/fetch-pdfium.sh` before tests → mark-pdf integration tests bind the real runtime on linux CI; macos/windows domain jobs still skip them.
+- Workspace deps: +`futures-channel 0.3` (already in tree via gpui; the awaitable worker seam without coupling Layer C to a UI runtime — addition flagged here per plan.md §21).
+
+**Decisions:**
+
+- Display size comes from our own `PageGeometry::display_size()` math, cross-checked in tests against `FPDF_GetPageWidthF` (which returns post-rotation size) — one source of truth for the rotation swap, validated from two directions.
+- The first 180° formula shipped wrong (y-flip borrowed from rotation 0): round-trip tests passed because forward/inverse were *consistently* wrong — the absolute corner fixtures caught it. Lesson reaffirming §8.1: round-trip alone is not enough; anchor mappings need known-good absolute expectations.
+- Worker holds `Pdfium` on the thread's stack with documents in a local map — documents borrow the `Pdfium` (`PdfDocument<'a>`), so ownership on the worker loop avoids self-referential structs entirely.
+- Requests over blocking mpsc (worker may block in `recv`), replies over async oneshot (caller may be any executor): the seam stays GPUI-free per the Layer C boundary (docs/architecture.md crate table).
+- Fixture quadrant-in-user-space + assert-quadrant-in-display-space is the strongest rotation regression test available outside the app; it pins the empirically-verified convention that `FPDF_RenderPageBitmap` applies `/Rotate`.
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 48 passed (10 coordinates + 15 mark-pdf new), 0 failed.
+- Native (Omarchy, eDP-1 @1.6): `mark <fixture>` launches; empty-launch regression alive at kill. Screenshot diff verification (empty workspace vs document): letter-portrait shows the red user-space bottom-left quadrant at display bottom-left, quadrant 328×424 px (ratio 0.774 = 306:396 exact); rotated-90 shows it at display top-left with dimensions swapped to 422×328 px (ratio 1.29 = 396:306 exact) — the full load→geometry→render→display chain honors /Rotate natively.
+- Real Ctrl+O portal dialog on a PDF remains a manual check (same caveat as Phase 3); CLI-arg open covers the load path.
+
+**Next:**
+
+1. Phase 5: thumbnails (lazy, progressive, §11.2), page navigation (PageUp/PageDown/Home/End, current-page indication), zoom/pan/fit with viewport-sized re-render via the `PageRenderCache` (§11.1) — the worker/`RenderedPage.scale` seam is ready for it.
+2. Watch the first CI run with the PDFium fetch step (ubuntu) — network-dependent download of ~3.5 MB from bblanchon releases.
+
 ### 2026-10-03 — Phase 3 complete: open image (dialog, decode, one-page canvas)
 
 **Context:**

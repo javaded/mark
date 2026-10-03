@@ -42,7 +42,8 @@ fn main() {
                 cx,
                 |_, cx| {
                     cx.new(|cx| {
-                        let mut app = MarkApp::new();
+                        let pdf = std::sync::Arc::new(mark_pdf::PdfWorker::spawn());
+                        let mut app = MarkApp::new(pdf);
                         if let Some(path) = open_path {
                             app.open_path(path, cx);
                         }

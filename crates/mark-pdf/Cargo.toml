@@ -7,4 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+mark-core.workspace = true
 pdfium-render.workspace = true
+image.workspace = true
+thiserror.workspace = true
+futures-channel.workspace = true
+
+[dev-dependencies]
+pollster = "0.4"
