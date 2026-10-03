@@ -17,7 +17,8 @@ use gpui_kit::{
 };
 use gpui_omarchy::{ActiveTheme, ButtonVariant, IconName, Theme, button, focus_scope, icon};
 use mark_core::{
-    AddObject, AssetId, AssetKind, DocumentObject, DocumentSession, ImageObject, ObjectId, Vec2,
+    AddObject, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession, ImageObject,
+    ObjectId, Rect, Vec2,
 };
 use mark_export::library::AssetLibrary;
 use mark_pdf::{PdfDocumentHandle, PdfWorker, RenderedPage};
@@ -27,10 +28,10 @@ use crate::canvas;
 use crate::thumbnails;
 use crate::viewer::ViewerState;
 use crate::{
-    ClearSelection as ClearSelectionAction, FirstPage as FirstPageAction,
-    LastPage as LastPageAction, NextPage as NextPageAction, OpenDocument,
-    PreviousPage as PreviousPageAction, ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction,
-    ZoomOut as ZoomOutAction,
+    ClearSelection as ClearSelectionAction, DeleteSelected as DeleteSelectedAction,
+    FirstPage as FirstPageAction, LastPage as LastPageAction, NextPage as NextPageAction,
+    OpenDocument, PreviousPage as PreviousPageAction, Redo as RedoAction, Undo as UndoAction,
+    ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction, ZoomOut as ZoomOutAction,
 };
 
 /// Everything needed to display an opened document.
@@ -45,11 +46,30 @@ pub struct OpenedDocument {
     pdf: Option<PdfDocumentHandle>,
     viewer: ViewerState,
     selected_object: Option<ObjectId>,
+    /// Pointer position of the last press inside an object or handle:
+    /// gestures anchor here, not at GPUI's drag-activation point (which
+    /// fires after ~2px of movement and would swallow the first step).
+    press_pointer: Option<Vec2>,
+    /// In-progress move/resize; the preview rect overlays the stored
+    /// geometry until pointer release commits one command (§14).
+    pub(crate) gesture: Option<crate::manipulation::Gesture>,
 }
 
 impl OpenedDocument {
     pub fn session(&self) -> &DocumentSession {
         &self.session
+    }
+
+    /// The editor selection (test observation).
+    #[cfg(test)]
+    pub(crate) fn selected_object(&self) -> Option<ObjectId> {
+        self.selected_object
+    }
+
+    /// View state (zoom/pan) access for gesture math in tests.
+    #[cfg(test)]
+    pub(crate) fn viewer(&self) -> &ViewerState {
+        &self.viewer
     }
 }
 
@@ -77,7 +97,19 @@ pub struct MarkApp {
 
 impl MarkApp {
     pub fn new(pdf: Arc<PdfWorker>, cx: &mut Context<Self>) -> Self {
-        let (library, notice) = Self::open_library();
+        let root = platform::app_data_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("mark-library-fallback"));
+        Self::with_library_root(pdf, root, cx)
+    }
+
+    /// Constructor with the library root injected: production uses the
+    /// platform app-data directory; tests use a throwaway directory.
+    pub(crate) fn with_library_root(
+        pdf: Arc<PdfWorker>,
+        root: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (library, notice) = Self::open_library(&root);
         let mut app = Self {
             open: OpenState::Empty,
             pdf,
@@ -93,10 +125,8 @@ impl MarkApp {
     /// Opens the persisted library; a damaged manifest degrades to an
     /// empty session-only library behind a notice rather than hiding the
     /// app behind an error (plan.md §17).
-    fn open_library() -> (AssetLibrary, Option<SharedString>) {
-        let root = platform::app_data_dir()
-            .unwrap_or_else(|| std::env::temp_dir().join("mark-library-fallback"));
-        match AssetLibrary::open(&root) {
+    fn open_library(root: &Path) -> (AssetLibrary, Option<SharedString>) {
+        match AssetLibrary::open(root) {
             Ok(library) => (library, None),
             Err(_) => (
                 AssetLibrary::open(&std::env::temp_dir().join("mark-library-fallback"))
@@ -147,6 +177,15 @@ impl MarkApp {
         match &mut self.open {
             OpenState::Opened(opened) => &mut opened.viewer,
             _ => unreachable!("viewer access requires an open document"),
+        }
+    }
+
+    /// The open document (test observation).
+    #[cfg(test)]
+    pub(crate) fn opened_document(&self) -> Option<&OpenedDocument> {
+        match &self.open {
+            OpenState::Opened(opened) => Some(opened),
+            _ => None,
         }
     }
 
@@ -241,12 +280,184 @@ impl MarkApp {
         }
     }
 
-    /// Escape: clears the object selection (plan.md §15).
+    /// Escape: cancels any in-progress gesture, then clears the object
+    /// selection (plan.md §15).
     fn handle_clear_selection(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let OpenState::Opened(opened) = &mut self.open {
+            changed = opened.gesture.take().is_some();
+            changed |= opened.selected_object.take().is_some();
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    // ----- object manipulation (plan.md §13, §14) --------------------------------
+
+    /// Press inside `object`: selects it and records the press position as
+    /// the anchor for a drag that may follow.
+    pub(crate) fn object_press(&mut self, id: ObjectId, pointer: Vec2, cx: &mut Context<Self>) {
+        if let OpenState::Opened(opened) = &mut self.open {
+            opened.press_pointer = Some(pointer);
+            if opened.selected_object != Some(id) {
+                opened.selected_object = Some(id);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Press inside a resize handle: keeps the selection (the press must
+    /// not bubble to the canvas, which would clear it) and anchors a
+    /// possible resize drag at the press position.
+    pub(crate) fn handle_press(&mut self, pointer: Vec2) {
+        if let OpenState::Opened(opened) = &mut self.open {
+            opened.press_pointer = Some(pointer);
+        }
+    }
+
+    /// The anchor a gesture starts from: the recorded press, falling back
+    /// to the drag-activation position.
+    fn gesture_anchor(opened: &OpenedDocument, drag_start: Vec2) -> Vec2 {
+        opened.press_pointer.unwrap_or(drag_start)
+    }
+
+    /// A move drag started on `object` (drag-activation pointer position).
+    pub(crate) fn begin_move(&mut self, object: ObjectId, pointer: Vec2) {
+        if let OpenState::Opened(opened) = &mut self.open {
+            let Some(mark_core::ObjectKind::Image(data)) = opened
+                .session
+                .document()
+                .find_object(object)
+                .map(|object| object.kind().clone())
+            else {
+                return;
+            };
+            let anchor = Self::gesture_anchor(opened, pointer);
+            opened.gesture = Some(crate::manipulation::Gesture::begin_move(
+                object,
+                Vec2::new(data.x, data.y),
+                Vec2::new(data.width, data.height),
+                anchor,
+            ));
+        }
+    }
+
+    /// A resize drag started on `object`'s `corner` handle.
+    pub(crate) fn begin_resize(
+        &mut self,
+        object: ObjectId,
+        corner: crate::manipulation::Corner,
+        aspect_lock: bool,
+        pointer: Vec2,
+    ) {
+        if let OpenState::Opened(opened) = &mut self.open {
+            let transform = opened.viewer.transform().unwrap_or_default();
+            let Some(mark_core::ObjectKind::Image(data)) = opened
+                .session
+                .document()
+                .find_object(object)
+                .map(|object| object.kind().clone())
+            else {
+                return;
+            };
+            let anchor = Self::gesture_anchor(opened, pointer);
+            opened.gesture = Some(crate::manipulation::Gesture::begin_resize(
+                object,
+                Rect {
+                    x: data.x,
+                    y: data.y,
+                    width: data.width,
+                    height: data.height,
+                },
+                corner,
+                aspect_lock,
+                anchor,
+                transform,
+            ));
+        }
+    }
+
+    /// Canvas click on empty space (no object/handle consumed it): clear
+    /// the selection. A pending gesture is untouched — its release still
+    /// commits.
+    pub(crate) fn clear_selection_if_idle(&mut self, cx: &mut Context<Self>) {
         if let OpenState::Opened(opened) = &mut self.open
             && opened.selected_object.take().is_some()
         {
             cx.notify();
+        }
+    }
+
+    /// Pointer moved during an active gesture: refresh the live preview.
+    pub(crate) fn move_gesture(&mut self, pointer: Vec2, cx: &mut Context<Self>) {
+        if let OpenState::Opened(opened) = &mut self.open
+            && let Some(gesture) = opened.gesture.as_mut()
+        {
+            let transform = opened.viewer.transform().unwrap_or_default();
+            gesture.update_pointer(pointer, transform);
+            cx.notify();
+        }
+    }
+
+    /// Pointer released: commit the gesture as one undoable command
+    /// (plan.md §14 — never one undo step per pointer movement).
+    pub(crate) fn end_gesture(&mut self, cx: &mut Context<Self>) {
+        let gesture = match &mut self.open {
+            OpenState::Opened(opened) => {
+                opened.press_pointer = None;
+                opened.gesture.take()
+            }
+            _ => None,
+        };
+        let Some(gesture) = gesture else {
+            return;
+        };
+        if let Some(command) = gesture.commit()
+            && let OpenState::Opened(opened) = &mut self.open
+        {
+            opened.session.execute(command);
+        }
+        cx.notify();
+    }
+
+    /// Delete/Backspace: removes the selected overlay object — never page
+    /// content (plan.md §13.2).
+    fn handle_delete_selected(&mut self, cx: &mut Context<Self>) {
+        if let OpenState::Opened(opened) = &mut self.open
+            && let Some(id) = opened.selected_object.take()
+            && opened.session.document().find_object(id).is_some()
+        {
+            opened.session.execute(Box::new(DeleteObject::new(id)));
+            cx.notify();
+        }
+    }
+
+    fn handle_undo(&mut self, cx: &mut Context<Self>) {
+        if let OpenState::Opened(opened) = &mut self.open
+            && opened.session.undo()
+        {
+            Self::validate_selection(opened);
+            cx.notify();
+        }
+    }
+
+    fn handle_redo(&mut self, cx: &mut Context<Self>) {
+        if let OpenState::Opened(opened) = &mut self.open
+            && opened.session.redo()
+        {
+            Self::validate_selection(opened);
+            cx.notify();
+        }
+    }
+
+    /// Drops a selection that no longer points at a live object (undo of a
+    /// placement, redo of a delete, …).
+    fn validate_selection(opened: &mut OpenedDocument) {
+        if let Some(id) = opened.selected_object
+            && opened.session.document().find_object(id).is_none()
+        {
+            opened.selected_object = None;
         }
     }
 
@@ -289,6 +500,8 @@ impl MarkApp {
                             pdf: None,
                             viewer,
                             selected_object: None,
+                            press_pointer: None,
+                            gesture: None,
                         }))
                     }
                     Err(_) => OpenState::Failed { name },
@@ -330,6 +543,8 @@ impl MarkApp {
                             pdf: Some(handle),
                             viewer: ViewerState::new_pdf(page_sizes),
                             selected_object: None,
+                            press_pointer: None,
+                            gesture: None,
                         }));
                         cx.notify();
                         // The viewport is still unknown; the canvas probe
@@ -628,6 +843,11 @@ impl Render for MarkApp {
             .on_action(cx.listener(|this, _: &ClearSelectionAction, _window, cx| {
                 this.handle_clear_selection(cx)
             }))
+            .on_action(cx.listener(|this, _: &DeleteSelectedAction, _window, cx| {
+                this.handle_delete_selected(cx)
+            }))
+            .on_action(cx.listener(|this, _: &UndoAction, _window, cx| this.handle_undo(cx)))
+            .on_action(cx.listener(|this, _: &RedoAction, _window, cx| this.handle_redo(cx)))
             .flex()
             .flex_col()
             .size_full()
@@ -678,17 +898,28 @@ fn workspace(
     let selected = opened.selected_object;
     // Placed objects of the current page, resolved to cached bitmaps: the
     // canvas draws page → objects → selection in one pass (plan.md §13).
+    let gesture = opened.gesture.as_ref();
     let placed: Vec<canvas::PlacedObject> = page
         .map(|page| {
             page.objects()
                 .iter()
                 .map(|object| {
                     let mark_core::ObjectKind::Image(data) = object.kind();
+                    // An in-progress gesture replaces the stored geometry
+                    // with its live preview.
+                    let live = gesture
+                        .filter(|gesture| gesture.object == object.id())
+                        .map(|gesture| gesture.live);
+                    let (x, y, width, height) = match live {
+                        Some(rect) => (rect.x, rect.y, rect.width, rect.height),
+                        None => (data.x, data.y, data.width, data.height),
+                    };
                     canvas::PlacedObject {
-                        x: data.x,
-                        y: data.y,
-                        width: data.width,
-                        height: data.height,
+                        id: object.id(),
+                        x,
+                        y,
+                        width,
+                        height,
                         opacity: data.opacity,
                         image: library.images.get(&data.asset_id).cloned(),
                         selected: selected == Some(object.id()),
