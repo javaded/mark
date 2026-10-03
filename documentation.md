@@ -29,6 +29,42 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-03 — Phase 5 complete: page viewer — thumbnails, navigation, zoom/pan/fit
+
+**Context:**
+
+Phase 5 of `plan.md` §24: lazy progressive thumbnails (§11.2), current-page indication, next/prev/first/last navigation, zoom/pan/fit with viewport-sized re-rendering through a bounded `PageRenderCache` (§11.1). The previous session froze near the end of the implementation with all Phase 5 files written but unverified; this session verified, fixed tooling-level verification mistakes, and shipped it.
+
+**Actions:**
+
+- Recovered the frozen working tree: `viewer.rs` + `thumbnails.rs` (new), `app.rs`/`canvas.rs`/`main.rs` (modified) — all Phase 5 code was present and compiled; the remaining work was verification and shipping.
+- `viewer.rs` — the new page-viewer state module, pure state with no worker/GPUI-context access: `ViewerState` (current page, `ZoomMode` Fit|Custom, pan, viewport, render cache, thumbnail queue), discrete zoom ladder 0.5–4.0 (§7 range), render widths bucketed to 256 px (min 256, max 4096) so small zoom changes reuse the existing bitmap (§11.1), LRU render cache capacity 12 with 0.9 reuse-fraction acceptance, pan clamping (content centered when it fits, never pushable out of view), zoom anchored on the document point under the viewport center, navigation resets pan and scrolls the sidebar to the current page, thumbnail queue driven by visible-range recording with one request in flight and the current page prioritized (§11.2). 11 unit tests: ladder steps/clamps, bucket rounding, fit-zoom axis math, pan clamping, zoom-center anchoring, navigation bounds, wanted-render bucketize/dedupe/reuse, image documents never re-render, LRU eviction, thumbnail queue gating/priority, row sizes follow page aspect.
+- `thumbnails.rs` — virtualized sidebar (`v_virtual_list` + `scrollbar` from the pinned stack): rows exist only for the visible range, visibility recording enqueues missing thumbnails, current page marked by accent border + bright label, click navigates. 240 px render width, 160 px display (§11.2 band).
+- `canvas.rs` — `canvas` element probe measures the stage each frame; viewport (logical px + scale factor) drives fit zoom and render sizing; deferred `refresh_view` after measurement so no async work starts mid-frame. Page drawn as an absolutely positioned `img` scaled to `page × zoom` (bitmap resolution-independent of display size, §11.1 reuse), wheel + drag pan via GPUI drag protocol (`PanCanvas`), zoom/pan never leaves the page unreachable (clamped transform).
+- `app.rs` — render-request loop: `refresh_view` issues the current page's render at the bucketed viewport width, then pumps queued thumbnails one at a time, never while a page render is pending (§11.2 priority rule). Stale replies (closed document, superseded width) are dropped by handle/page/width guards. Status bar (page indicator + first/prev/next/last buttons, plan.md §10) and header zoom controls (−/percent/+/fit, disabled without a document) added. Keybindings per §15: PageUp/PageDown/Home/End, `=`/`+`/`-`/`0`.
+- `main.rs` — new actions (NextPage, PreviousPage, FirstPage, LastPage, ZoomIn, ZoomOut, ZoomFit) bound in `main`.
+
+**Decisions:**
+
+- Viewport probing via a `canvas` paint closure rather than `canvas_element`/measurement APIs inside prepaint: paint runs every frame with final bounds; the probe only *records* the viewport and defers requests — state mutation in paint stays bookkeeping-only.
+- `ViewerState` is deliberately GPUI-free except for the `RenderImage` cache values and the scroll handle — all request spawning stays in `MarkApp`, keeping the what-to-render decision testable without a window (the unit tests exercise the full cache/queue state machines).
+- Render bucket 256 px chosen to balance PDFium work (re-renders happen at most one bucket per zoom gesture) and sharpness (0.9 reuse fraction keeps a one-bucket-lower bitmap on screen while the higher one renders).
+- Thumbnails reuse `render_page` at fixed 240 px instead of a separate worker API: same code path, different width — the worker stays a two-method seam.
+- Pan via wheel and drag both land in `pan_by`/`PanDrag`; the clamped transform (not raw pan) is applied at draw time so over-panning can never strand the page.
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 59 passed (11 new viewer tests), 0 failed.
+- Native (Omarchy, eDP-1 @1.6): `mark mixed-sizes.pdf` — screenshot pixel-classification verified: thumbnails at exact page aspects (green quadrant 128×99 = 160-logical-wide landscape thumb, yellow 128×102 for the 500×400 page), canvas page 1 red bottom-left quadrant at display bottom-left, fit zoom 0.5586 = 341/612 exact, centered pan (501−264)/2 = 118.5 exact on page 2. `PageDown` → page 2 green top-right at display top-right with re-render at fit; two `+` presses → zoom 0.4317→0.5→0.67 ladder with re-render bucket 768→1024 and center-anchored clamped pan; `End` + `0` → page 3 yellow, fit 0.68375 = 341/500 with centered pan. Empty launch `timeout 10s` → exit 124 (alive at kill, no panic).
+- Tooling lesson recorded: hyprctl reports logical window geometry while `grim -g` crops in logical coordinates and returns physical-resolution pixels — an earlier mixed-space crop produced a false "nothing rendered" reading that pixel-exact re-measurement disproved.
+- Live wheel/drag pan and Home/First/Prev via real pointer remain manual checks (state math unit-tested; same caveat class as the portal dialog in Phases 3–4).
+
+**Next:**
+
+1. Phase 6: signature library — asset import (normalized PNG copy into app storage, §9.3/§12), assets panel, place centered + selected.
+2. Consider a `wtype`-driven keyboard smoke script under `script/` reusing this session's verification recipe.
+
 ### 2026-10-03 — Phase 4 complete: PDF engine — worker thread, load/render, coordinate fixtures
 
 **Context:**

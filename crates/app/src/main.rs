@@ -2,6 +2,8 @@
 
 mod app;
 mod canvas;
+mod thumbnails;
+mod viewer;
 
 use std::path::PathBuf;
 
@@ -11,7 +13,20 @@ use gpui_kit::{
     WindowOptions, px, size,
 };
 
-gpui_kit::actions!(mark, [Quit, OpenDocument]);
+gpui_kit::actions!(
+    mark,
+    [
+        Quit,
+        OpenDocument,
+        NextPage,
+        PreviousPage,
+        FirstPage,
+        LastPage,
+        ZoomIn,
+        ZoomOut,
+        ZoomFit,
+    ]
+);
 
 fn main() {
     // Optional file argument: `mark picture.png` opens it directly, no dialog.
@@ -32,6 +47,17 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new(&format!("{modifier}-q"), Quit, None),
                 KeyBinding::new(&format!("{modifier}-o"), OpenDocument, None),
+                // Page navigation (plan.md §15).
+                KeyBinding::new("pageup", PreviousPage, None),
+                KeyBinding::new("pagedown", NextPage, None),
+                KeyBinding::new("home", FirstPage, None),
+                KeyBinding::new("end", LastPage, None),
+                // Zoom: "+"/"=" both zoom in so shifted and unshifted keys
+                // work across layouts (plan.md §15).
+                KeyBinding::new("=", ZoomIn, None),
+                KeyBinding::new("+", ZoomIn, None),
+                KeyBinding::new("-", ZoomOut, None),
+                KeyBinding::new("0", ZoomFit, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
@@ -40,15 +66,19 @@ fn main() {
             gpui_kit::open_window(
                 window_options(SharedString::from("Mark"), cx),
                 cx,
-                |_, cx| {
-                    cx.new(|cx| {
+                |window, cx| {
+                    let app = cx.new(|cx| {
                         let pdf = std::sync::Arc::new(mark_pdf::PdfWorker::spawn());
-                        let mut app = MarkApp::new(pdf);
+                        let mut app = MarkApp::new(pdf, cx);
                         if let Some(path) = open_path {
                             app.open_path(path, cx);
                         }
                         app
-                    })
+                    });
+                    // Actions dispatch through the focused node: give the
+                    // app keyboard focus from the first frame.
+                    window.focus(&app.read(cx).focus_handle().clone(), cx);
+                    app
                 },
             )
             .expect("failed to open window");
