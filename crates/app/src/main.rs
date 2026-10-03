@@ -3,7 +3,10 @@
 mod app;
 mod assets;
 mod canvas;
+mod manipulation;
 mod thumbnails;
+#[cfg(test)]
+mod ui_tests;
 mod viewer;
 
 use std::path::PathBuf;
@@ -27,6 +30,9 @@ gpui_kit::actions!(
         ZoomOut,
         ZoomFit,
         ClearSelection,
+        DeleteSelected,
+        Undo,
+        Redo,
     ]
 );
 
@@ -41,28 +47,7 @@ fn main() {
             // (Omarchy theme on Linux; Tokyo Night fallback elsewhere).
             gpui_omarchy::init(cx);
 
-            let modifier = if cfg!(target_os = "macos") {
-                "cmd"
-            } else {
-                "ctrl"
-            };
-            cx.bind_keys([
-                KeyBinding::new(&format!("{modifier}-q"), Quit, None),
-                KeyBinding::new(&format!("{modifier}-o"), OpenDocument, None),
-                // Page navigation (plan.md §15).
-                KeyBinding::new("pageup", PreviousPage, None),
-                KeyBinding::new("pagedown", NextPage, None),
-                KeyBinding::new("home", FirstPage, None),
-                KeyBinding::new("end", LastPage, None),
-                // Zoom: "+"/"=" both zoom in so shifted and unshifted keys
-                // work across layouts (plan.md §15).
-                KeyBinding::new("=", ZoomIn, None),
-                KeyBinding::new("+", ZoomIn, None),
-                KeyBinding::new("-", ZoomOut, None),
-                KeyBinding::new("0", ZoomFit, None),
-                // Selection (plan.md §15).
-                KeyBinding::new("escape", ClearSelection, None),
-            ]);
+            init_keybindings(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
 
             // open_window mounts the base Root, which later renders
@@ -89,6 +74,38 @@ fn main() {
 
             cx.activate(true);
         });
+}
+
+/// Production keybindings (plan.md §15); tests reuse the same table so
+/// synthetic keys exercise the real dispatch path.
+fn init_keybindings(cx: &mut gpui_kit::App) {
+    let modifier = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    cx.bind_keys([
+        KeyBinding::new(&format!("{modifier}-q"), Quit, None),
+        KeyBinding::new(&format!("{modifier}-o"), OpenDocument, None),
+        // Page navigation (plan.md §15).
+        KeyBinding::new("pageup", PreviousPage, None),
+        KeyBinding::new("pagedown", NextPage, None),
+        KeyBinding::new("home", FirstPage, None),
+        KeyBinding::new("end", LastPage, None),
+        // Zoom: "+"/"=" both zoom in so shifted and unshifted keys
+        // work across layouts (plan.md §15).
+        KeyBinding::new("=", ZoomIn, None),
+        KeyBinding::new("+", ZoomIn, None),
+        KeyBinding::new("-", ZoomOut, None),
+        KeyBinding::new("0", ZoomFit, None),
+        // Selection + editing (plan.md §15).
+        KeyBinding::new("escape", ClearSelection, None),
+        KeyBinding::new("delete", DeleteSelected, None),
+        KeyBinding::new("backspace", DeleteSelected, None),
+        KeyBinding::new(&format!("{modifier}-z"), Undo, None),
+        KeyBinding::new(&format!("{modifier}-shift-z"), Redo, None),
+        KeyBinding::new(&format!("{modifier}-y"), Redo, None),
+    ]);
 }
 
 fn window_options(title: SharedString, cx: &mut gpui_kit::App) -> WindowOptions {

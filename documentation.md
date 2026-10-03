@@ -29,6 +29,41 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-04 — Phase 7 complete: object manipulation + undo/redo, headless UI integration tests
+
+**Context:**
+
+Phase 7 of `plan.md` §24 (§13, §14): click-select, drag-move, corner-resize aspect-locked, delete — each committing one command — with Ctrl+Z/Ctrl+Shift+Z from this phase forward. The previous session froze mid-implementation; this session finished, and delivered the §20.4 interaction-test infrastructure that verified it.
+
+**Actions:**
+
+- Recovered the frozen working tree: `manipulation.rs` (new) + `app.rs`/`canvas.rs`/`main.rs` (modified) all compiled; remaining work was verification, which found and fixed real bugs (below).
+- `manipulation.rs`: gesture state machines — `Gesture::begin_move`/`begin_resize` carry `pointer_start`/`pointer_now` (screen px) and a live preview rect (document units); motionless gestures commit nothing (no no-op undo steps, §14); commit produces `MoveObject`/`ResizeObject`. Resize: dragged corner moves by the screen delta ÷ zoom, opposite corner pinned, aspect locked by default (Shift at gesture start unlocks, §13 convention documented in-code), edges clamp at 16 pt minimum. 10 unit tests incl. zoom scaling and pointer-origin independence.
+- `canvas.rs`: object element draws at page-local coords (`doc × zoom`); pointer-down selects + records the press anchor; drag protocol (`MoveObjectDrag`/`ResizeObjectDrag`) drives gestures; release commits via viewport `on_mouse_up`. Selected object gains accent outline + four corner handles at fixed 10 px UI size; handle positions are object-local. Click-away on empty canvas clears selection; handle presses stop propagation (a bubbling press would clear the selection and unmount the handle mid-press).
+- `app.rs`: `object_press`/`handle_press` record the press pointer; gestures anchor there — not at GPUI's drag-activation point (~2 px into the gesture), which would swallow the first movement step. `end_gesture` commits one command per gesture and clears the anchor. Delete/Backspace → `DeleteObject`; Ctrl+Z/Ctrl+Shift+Z/Ctrl+Y → undo/redo with selection re-validation (undo of a placement, redo of a delete); Escape cancels a pending gesture, then clears selection.
+- `main.rs`: DeleteSelected/Undo/Redo actions + §15 keybindings; binding table extracted into `init_keybindings` so tests dispatch through the real keymap.
+- UI integration tests (`ui_tests.rs`, plan.md §20.4): gpui-kit `test-support` (dev-dependency, same `=0.7.0` source), `#[gpui_kit::test]` headless windows driving the production `MarkApp` with synthetic pointer/keyboard — click places (panel row), click-away, Escape, full `window.drag` move → one `MoveObject` with exact delta ÷ zoom, handle drag → aspect-true `ResizeObject`, delete/undo/redo round-trips — all asserted on the document model, never screenshots. `MarkApp::with_library_root` injects a tempdir library; `.test_support()` (identity no-op in production builds) on asset rows, viewport, objects, handles.
+- Two real bugs the tests caught before any human did: (1) nested absolute positioning — the object used window-space `document_to_screen` inside the positioned page div and handles used window-space corners inside the positioned object div, double-offsetting objects by pan and placing handles off-window (unhittable); fixed with ancestor-local coordinates. (2) the drag-activation anchor jump (above).
+
+**Decisions:**
+
+- Interaction verification via gpui-kit headless UI tests instead of ydotool pointer synthesis (the Phase 6 "Next" open question): §20.4's prescribed approach — real components, real event dispatch, model-level assertions; no OS-level pointer tool dependency, runs in CI on ubuntu.
+- Tests live in-crate (`#[cfg(test)] mod ui_tests` on the bin) so private-field assertions need no public test API; only three small `#[cfg(test)]` accessors added.
+- Gestures anchor at the press point (not drag activation): the grab offset stays constant through the gesture — the same behavior as the pan gesture.
+- Live drag preview stays view-layer (the `Gesture` overlay replaces stored geometry at render); the document only changes at commit — §13 "pointer movement updates document-space coordinates" is satisfied per-frame by the preview, not by mutating per-move.
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 80 passed (10 manipulation + 5 UI integration new), 0 failed.
+- Native (Omarchy): re-seeded `~/.local/share/mark` (pure-stdlib python PNG writer; first seed misplaced `library.json` under `assets/` and omitted the `assets/` prefix in `file` — fixed against the import-code conventions) → `mark letter-portrait.pdf`: pixel-classified screenshot shows magenta signature preview 154×58 physical = 96×36 logical exact and cyan stamp 58×58 = 36×36 exact in the panel, page quadrant correct. Empty launch: exit 124 (alive at kill).
+- Live pointer manipulation on native remains manual (no pointer synthesis installed; keyboard `wtype` exists but pointer does not) — the interaction paths are covered headlessly by the UI tests.
+
+**Next:**
+
+1. Phase 8 (multi-object / multi-page workflow): duplicate, copy/paste, "Duplicate to page…" — `DuplicateObject`/`MoveObjectToPage`/`DuplicateToPage` commands already exist in mark-core.
+2. Consider a contextual toolbar for the selected object (§13) during Phase 8 polish.
+
 ### 2026-10-03 — Phase 6 complete: signature library — assets panel, PNG-normalized import, click placement
 
 **Context:**

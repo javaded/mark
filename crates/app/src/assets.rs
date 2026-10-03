@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use gpui_kit::{
     ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
-    rems,
+    RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
+    Window, div, img, px, rems,
 };
 use gpui_omarchy::{ButtonVariant, IconName, Theme, icon, icon_button};
 use mark_core::{Asset, AssetId, AssetKind};
@@ -183,6 +183,7 @@ fn row(
 
     div()
         .id(format!("mark-asset-{id}"))
+        .test_support()
         .flex()
         .items_center()
         .gap(rems(0.5))

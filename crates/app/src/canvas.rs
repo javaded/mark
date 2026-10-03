@@ -9,14 +9,15 @@ use std::sync::Arc;
 
 use gpui_kit::{
     AnyElement, AppContext as _, Context, DragMoveEvent, Empty, InteractiveElement as _,
-    IntoElement, MouseButton, MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage,
-    ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, WeakEntity,
-    Window, canvas, div, img, px, rems,
+    IntoElement, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
+    Render, RenderImage, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement as _,
+    Styled as _, TestSupportExt as _, WeakEntity, Window, canvas, div, img, px, rems,
 };
 use gpui_omarchy::Theme;
-use mark_core::{Vec2, ViewTransform};
+use mark_core::{ObjectId, Vec2, ViewTransform};
 
 use crate::MarkApp;
+use crate::manipulation::Corner;
 use crate::viewer::ViewerState;
 
 /// Drag value marking an active canvas pan (GPUI drag protocol).
@@ -28,9 +29,31 @@ impl Render for PanCanvas {
     }
 }
 
+/// Drag value marking an object move gesture.
+struct MoveObjectDrag;
+
+impl Render for MoveObjectDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Drag value marking a handle resize gesture.
+struct ResizeObjectDrag;
+
+impl Render for ResizeObjectDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Corner handle side in screen px (fixed UI size, not zoom-scaled).
+const HANDLE_SIZE: f32 = 10.;
+
 /// A placed image object resolved for drawing: page-space placement plus
 /// the cached asset bitmap (absent until its decode lands).
 pub(crate) struct PlacedObject {
+    pub id: ObjectId,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -80,6 +103,7 @@ pub(crate) fn stage(
         .child(
             div()
                 .id("mark-canvas-viewport")
+                .test_support()
                 .flex()
                 .size_full()
                 .overflow_hidden()
@@ -122,7 +146,16 @@ pub(crate) fn stage(
                     page_size,
                     image.as_ref(),
                     placed,
+                    weak,
                 ))
+                // Click-away: empty canvas clears the selection; object
+                // handlers stop propagation first.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.clear_selection_if_idle(cx);
+                    }),
+                )
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                     let (dx, dy) = scroll_delta(event);
                     this.viewer_mut().pan_by(dx, dy);
@@ -151,17 +184,28 @@ pub(crate) fn stage(
                         cx.notify();
                     }),
                 )
+                .on_drag_move(
+                    cx.listener(|this, event: &DragMoveEvent<MoveObjectDrag>, _, cx| {
+                        this.move_gesture(event_pointer(event), cx);
+                    }),
+                )
+                .on_drag_move(cx.listener(
+                    |this, event: &DragMoveEvent<ResizeObjectDrag>, _, cx| {
+                        this.move_gesture(event_pointer(event), cx);
+                    },
+                ))
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseUpEvent, _, cx| {
                         this.viewer_mut().pan_drag_ended();
-                        cx.notify();
+                        this.end_gesture(cx);
                     }),
                 )
                 .on_mouse_up_out(
                     MouseButton::Left,
-                    cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
                         this.viewer_mut().pan_drag_ended();
+                        this.end_gesture(cx);
                     }),
                 ),
         )
@@ -177,6 +221,7 @@ fn stage_element(
     page_size: Option<Vec2>,
     image: Option<&Arc<RenderImage>>,
     placed: &[PlacedObject],
+    weak: &WeakEntity<MarkApp>,
 ) -> AnyElement {
     match (transform, page_size, image) {
         (Some(transform), Some(page), Some(image)) => {
@@ -195,7 +240,7 @@ fn stage_element(
                 .children(
                     placed
                         .iter()
-                        .map(|object| object_element(theme, &transform, object)),
+                        .map(|object| object_element(theme, &transform, object, weak)),
                 )
                 .into_any_element()
         }
@@ -217,21 +262,56 @@ fn stage_element(
 }
 
 /// One placed object drawn over the page: the asset bitmap at its
-/// page-space rect through the view transform; selected objects carry the
-/// accent outline (plan.md §13; handles and dragging arrive in Phase 7).
+/// page-space rect through the view transform. Pointer-down selects;
+/// dragging moves; the selected object gains the accent outline and four
+/// corner resize handles (plan.md §13).
+///
+/// The object is absolutely positioned inside the (positioned) page div,
+/// so `left`/`top` are page-local: document units scaled by zoom, without
+/// pan — the page itself already carries the pan offset.
 fn object_element(
     theme: &Theme,
     transform: &ViewTransform,
     object: &PlacedObject,
+    weak: &WeakEntity<MarkApp>,
 ) -> gpui_kit::AnyElement {
-    let (x, y) = transform.document_to_screen(object.x, object.y);
+    let left = object.x * transform.zoom;
+    let top = object.y * transform.zoom;
+    let screen_w = object.width * transform.zoom;
+    let screen_h = object.height * transform.zoom;
+    let id = object.id;
+
+    let select_weak = weak.clone();
+    let drag_weak = weak.clone();
     let mut element = div()
+        .id(format!("mark-object-{id}"))
+        .test_support()
         .absolute()
-        .left(px(x))
-        .top(px(y))
-        .w(px(object.width * transform.zoom))
-        .h(px(object.height * transform.zoom))
-        .opacity(object.opacity);
+        .left(px(left))
+        .top(px(top))
+        .w(px(screen_w))
+        .h(px(screen_h))
+        .opacity(object.opacity)
+        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            select_weak
+                .update(cx, |app, cx| {
+                    app.object_press(id, pointer_vec(event.position), cx);
+                })
+                .ok();
+        })
+        .on_drag(
+            MoveObjectDrag,
+            move |_: &MoveObjectDrag, position, _, cx| {
+                cx.stop_propagation();
+                drag_weak
+                    .update(cx, |app, _| {
+                        app.begin_move(id, pointer_vec(position));
+                    })
+                    .ok();
+                cx.new(|_| MoveObjectDrag)
+            },
+        );
     element = match &object.image {
         Some(image) => element.child(img(image.clone()).size_full()),
         // Bitmap still decoding: a dashed placeholder keeps the placement
@@ -243,8 +323,84 @@ fn object_element(
     };
     if object.selected {
         element = element.border_1().border_color(theme.accent).rounded_sm();
+        for corner in [
+            Corner::TopLeft,
+            Corner::TopRight,
+            Corner::BottomRight,
+            Corner::BottomLeft,
+        ] {
+            element = element.child(handle_element(theme, corner, id, screen_w, screen_h, weak));
+        }
     }
     element.into_any_element()
+}
+
+/// One corner resize handle of the selected object. Dragging resizes with
+/// the aspect locked; Shift at gesture start unlocks it (plan.md §13).
+///
+/// Positioned inside the (positioned) object div: offsets are object-local
+/// screen px relative to the object's top-left corner.
+fn handle_element(
+    theme: &Theme,
+    corner: Corner,
+    object: ObjectId,
+    width: f32,
+    height: f32,
+    weak: &WeakEntity<MarkApp>,
+) -> gpui_kit::AnyElement {
+    let half = HANDLE_SIZE / 2.;
+    let (hx, hy) = match corner {
+        Corner::TopLeft => (-half, -half),
+        Corner::TopRight => (width - half, -half),
+        Corner::BottomRight => (width - half, height - half),
+        Corner::BottomLeft => (-half, height - half),
+    };
+    let press_weak = weak.clone();
+    let drag_weak = weak.clone();
+    div()
+        .id(format!("mark-handle-{}-{object}", corner.label()))
+        .test_support()
+        .absolute()
+        .left(px(hx - half))
+        .top(px(hy - half))
+        .size(px(HANDLE_SIZE))
+        .rounded_sm()
+        .bg(theme.background)
+        .border_1()
+        .border_color(theme.accent)
+        // Keep the press inside the handle: bubbling to the canvas would
+        // clear the selection and unmount the handle mid-press.
+        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            press_weak
+                .update(cx, |app, _| {
+                    app.handle_press(pointer_vec(event.position));
+                })
+                .ok();
+        })
+        .on_drag(
+            ResizeObjectDrag,
+            move |_: &ResizeObjectDrag, position, window, cx| {
+                cx.stop_propagation();
+                let aspect_lock = !window.modifiers().shift;
+                drag_weak
+                    .update(cx, |app, _| {
+                        app.begin_resize(object, corner, aspect_lock, pointer_vec(position));
+                    })
+                    .ok();
+                cx.new(|_| ResizeObjectDrag)
+            },
+        )
+        .into_any_element()
+}
+
+/// Pointer position of a drag event as a Vec2 (screen px).
+fn event_pointer<T: 'static>(event: &DragMoveEvent<T>) -> Vec2 {
+    pointer_vec(event.event.position)
+}
+
+fn pointer_vec(position: Point<Pixels>) -> Vec2 {
+    Vec2::new(f32::from(position.x), f32::from(position.y))
 }
 
 /// Wheel deltas normalized to screen-space pixels.
