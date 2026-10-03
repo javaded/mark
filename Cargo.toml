@@ -41,6 +41,13 @@ uuid = { version = "1", features = ["v4"] }
 rfd = "0.17"
 thiserror = "2"
 
+# Persistence (plan.md §18): library manifest + settings serialization.
+# `dirs` (not `directories`) because it is already in the vendored registry
+# cache — same platform-dir semantics without a new download.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+
 # Async seam for the PDFium worker (§6.4): awaitable oneshot replies
 # without coupling Layer C to a UI runtime. Already in the tree via gpui.
 futures-channel = "0.3"

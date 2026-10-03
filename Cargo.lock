@@ -3682,6 +3682,7 @@ dependencies = [
  "gpui-omarchy",
  "image",
  "mark-core",
+ "mark-export",
  "mark-image",
  "mark-pdf",
  "platform",
@@ -3697,6 +3698,15 @@ dependencies = [
 [[package]]
 name = "mark-export"
 version = "0.1.0"
+dependencies = [
+ "image",
+ "mark-core",
+ "mark-image",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "mark-image"
@@ -4848,6 +4858,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "platform"
 version = "0.1.0"
 dependencies = [
+ "dirs 6.0.0",
  "rfd",
 ]
 

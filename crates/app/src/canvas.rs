@@ -28,6 +28,18 @@ impl Render for PanCanvas {
     }
 }
 
+/// A placed image object resolved for drawing: page-space placement plus
+/// the cached asset bitmap (absent until its decode lands).
+pub(crate) struct PlacedObject {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub opacity: f32,
+    pub image: Option<Arc<RenderImage>>,
+    pub selected: bool,
+}
+
 /// Converts decoded RGBA pixels into GPUI's BGRA render surface.
 ///
 /// GPUI samples render images as BGRA (gpui `RenderImage` contract); the
@@ -41,11 +53,12 @@ pub(crate) fn render_image(rgba: &image::RgbaImage) -> RenderImage {
 }
 
 /// The document stage: viewport probe, the page bitmap positioned by the
-/// view transform, and the pan interactions.
+/// view transform, the objects placed on it, and the pan interactions.
 pub(crate) fn stage(
     theme: &Theme,
     weak: &WeakEntity<MarkApp>,
     viewer: &mut ViewerState,
+    placed: &[PlacedObject],
     cx: &mut Context<MarkApp>,
 ) -> impl IntoElement {
     let page = viewer.current_page();
@@ -103,7 +116,13 @@ pub(crate) fn stage(
                     .absolute()
                     .size_full(),
                 )
-                .child(stage_element(theme, transform, page_size, image.as_ref()))
+                .child(stage_element(
+                    theme,
+                    transform,
+                    page_size,
+                    image.as_ref(),
+                    placed,
+                ))
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                     let (dx, dy) = scroll_delta(event);
                     this.viewer_mut().pan_by(dx, dy);
@@ -148,14 +167,16 @@ pub(crate) fn stage(
         )
 }
 
-/// The stage content: the positioned page when a bitmap exists, otherwise
-/// the centered rendering notice. The bitmap scales to the page box
-/// regardless of its pixel resolution (§11.1 reuse).
+/// The stage content: the positioned page with its placed objects, or the
+/// centered rendering notice while no bitmap exists. The page bitmap
+/// scales to the page box regardless of its pixel resolution (§11.1
+/// reuse); objects map through the same view transform.
 fn stage_element(
     theme: &Theme,
     transform: Option<ViewTransform>,
     page_size: Option<Vec2>,
     image: Option<&Arc<RenderImage>>,
+    placed: &[PlacedObject],
 ) -> AnyElement {
     match (transform, page_size, image) {
         (Some(transform), Some(page), Some(image)) => {
@@ -171,6 +192,11 @@ fn stage_element(
                 .border_color(theme.border)
                 .shadow_lg()
                 .child(img(image.clone()).size_full())
+                .children(
+                    placed
+                        .iter()
+                        .map(|object| object_element(theme, &transform, object)),
+                )
                 .into_any_element()
         }
         _ => div()
@@ -188,6 +214,37 @@ fn stage_element(
             )
             .into_any_element(),
     }
+}
+
+/// One placed object drawn over the page: the asset bitmap at its
+/// page-space rect through the view transform; selected objects carry the
+/// accent outline (plan.md §13; handles and dragging arrive in Phase 7).
+fn object_element(
+    theme: &Theme,
+    transform: &ViewTransform,
+    object: &PlacedObject,
+) -> gpui_kit::AnyElement {
+    let (x, y) = transform.document_to_screen(object.x, object.y);
+    let mut element = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(object.width * transform.zoom))
+        .h(px(object.height * transform.zoom))
+        .opacity(object.opacity);
+    element = match &object.image {
+        Some(image) => element.child(img(image.clone()).size_full()),
+        // Bitmap still decoding: a dashed placeholder keeps the placement
+        // and selection visible.
+        None => element
+            .border_1()
+            .border_dashed()
+            .border_color(theme.border),
+    };
+    if object.selected {
+        element = element.border_1().border_color(theme.accent).rounded_sm();
+    }
+    element.into_any_element()
 }
 
 /// Wheel deltas normalized to screen-space pixels.

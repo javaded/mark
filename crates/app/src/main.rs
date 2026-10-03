@@ -1,6 +1,7 @@
 //! Mark — desktop document signer (application shell).
 
 mod app;
+mod assets;
 mod canvas;
 mod thumbnails;
 mod viewer;
@@ -25,6 +26,7 @@ gpui_kit::actions!(
         ZoomIn,
         ZoomOut,
         ZoomFit,
+        ClearSelection,
     ]
 );
 
@@ -58,6 +60,8 @@ fn main() {
                 KeyBinding::new("+", ZoomIn, None),
                 KeyBinding::new("-", ZoomOut, None),
                 KeyBinding::new("0", ZoomFit, None),
+                // Selection (plan.md §15).
+                KeyBinding::new("escape", ClearSelection, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
 

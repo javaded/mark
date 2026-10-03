@@ -7,6 +7,7 @@
 //! worker thread (§6.4); this view only decides *what* to request and
 //! records replies.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,28 +16,35 @@ use gpui_kit::{
     ParentElement as _, Render, SharedString, Styled as _, Window, div, rems,
 };
 use gpui_omarchy::{ActiveTheme, ButtonVariant, IconName, Theme, button, focus_scope, icon};
-use mark_core::{DocumentSession, Vec2};
+use mark_core::{
+    AddObject, AssetId, AssetKind, DocumentObject, DocumentSession, ImageObject, ObjectId, Vec2,
+};
+use mark_export::library::AssetLibrary;
 use mark_pdf::{PdfDocumentHandle, PdfWorker, RenderedPage};
 
+use crate::assets;
 use crate::canvas;
 use crate::thumbnails;
 use crate::viewer::ViewerState;
 use crate::{
-    FirstPage as FirstPageAction, LastPage as LastPageAction, NextPage as NextPageAction,
-    OpenDocument, PreviousPage as PreviousPageAction, ZoomFit as ZoomFitAction,
-    ZoomIn as ZoomInAction, ZoomOut as ZoomOutAction,
+    ClearSelection as ClearSelectionAction, FirstPage as FirstPageAction,
+    LastPage as LastPageAction, NextPage as NextPageAction, OpenDocument,
+    PreviousPage as PreviousPageAction, ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction,
+    ZoomOut as ZoomOutAction,
 };
 
 /// Everything needed to display an opened document.
 ///
 /// `viewer` owns view state (current page, zoom/pan, render cache,
-/// thumbnails); document content lives in the session (plan.md §7.1).
+/// thumbnails); document content lives in the session (plan.md §7.1);
+/// `selected_object` is the editor selection on this document.
 pub struct OpenedDocument {
     session: DocumentSession,
     /// Set for PDF documents: the worker-side handle for render requests
     /// and closing.
     pdf: Option<PdfDocumentHandle>,
     viewer: ViewerState,
+    selected_object: Option<ObjectId>,
 }
 
 impl OpenedDocument {
@@ -55,6 +63,13 @@ enum OpenState {
 pub struct MarkApp {
     open: OpenState,
     pdf: Arc<PdfWorker>,
+    /// Signature/stamp library, persisted in the app data directory
+    /// (plan.md §12). App-level: it outlives any single document.
+    library: AssetLibrary,
+    /// Import/open failures surfaced in the assets panel (plan.md §17 copy).
+    library_notice: Option<SharedString>,
+    /// Decoded asset bitmaps for the panel and canvas, keyed by asset.
+    asset_images: HashMap<AssetId, Arc<gpui_kit::RenderImage>>,
     /// Keyboard focus for the whole app: actions (navigation, zoom, open)
     /// dispatch through the focused node.
     focus_handle: FocusHandle,
@@ -62,10 +77,62 @@ pub struct MarkApp {
 
 impl MarkApp {
     pub fn new(pdf: Arc<PdfWorker>, cx: &mut Context<Self>) -> Self {
-        Self {
+        let (library, notice) = Self::open_library();
+        let mut app = Self {
             open: OpenState::Empty,
             pdf,
+            library,
+            library_notice: notice,
+            asset_images: HashMap::new(),
             focus_handle: cx.focus_handle(),
+        };
+        app.load_asset_images(cx);
+        app
+    }
+
+    /// Opens the persisted library; a damaged manifest degrades to an
+    /// empty session-only library behind a notice rather than hiding the
+    /// app behind an error (plan.md §17).
+    fn open_library() -> (AssetLibrary, Option<SharedString>) {
+        let root = platform::app_data_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("mark-library-fallback"));
+        match AssetLibrary::open(&root) {
+            Ok(library) => (library, None),
+            Err(_) => (
+                AssetLibrary::open(&std::env::temp_dir().join("mark-library-fallback"))
+                    .expect("fresh temp library opens"),
+                Some("The signature library could not be read.".into()),
+            ),
+        }
+    }
+
+    /// Decodes any asset bitmaps not yet cached (startup and post-import).
+    fn load_asset_images(&mut self, cx: &mut Context<Self>) {
+        let root = self.library.root().to_path_buf();
+        let ids: Vec<AssetId> = self
+            .library
+            .assets()
+            .iter()
+            .map(|asset| asset.id())
+            .filter(|id| !self.asset_images.contains_key(id))
+            .collect();
+        for id in ids {
+            let root = root.clone();
+            cx.spawn(async move |this, cx| {
+                let image = cx
+                    .background_executor()
+                    .spawn(async move { mark_export::library::load_asset_image(&root, id).ok() })
+                    .await;
+                if let Some(rgba) = image {
+                    this.update(cx, |app, cx| {
+                        app.asset_images
+                            .insert(id, Arc::new(canvas::render_image(&rgba)));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
     }
 
@@ -101,6 +168,85 @@ impl MarkApp {
             self.open_pdf(path, cx);
         } else {
             self.open_image(path, cx);
+        }
+    }
+
+    // ----- signature/stamp assets (plan.md §12) ---------------------------------
+
+    /// Picks an image, imports it into the library as `kind`, and refreshes
+    /// the panel. Importing re-encodes to a normalized RGBA PNG inside the
+    /// app data directory (plan.md §9.3) — the source file is never touched.
+    pub(crate) fn import_asset(&mut self, kind: AssetKind, cx: &mut Context<Self>) {
+        let dialogs = platform::NativeFileDialogs;
+        cx.spawn(async move |this, cx| {
+            let Some(path) = platform::FilePicker::pick_open_image(&dialogs).await else {
+                return;
+            };
+            this.update(cx, |app, cx| {
+                let root = app.library.root().to_path_buf();
+                cx.spawn(async move |this, cx| {
+                    let imported = cx
+                        .background_executor()
+                        .spawn(async move {
+                            AssetLibrary::open(&root).and_then(|mut library| {
+                                library.import(&path, kind).map(|_| library)
+                            })
+                        })
+                        .await;
+                    this.update(cx, |app, cx| {
+                        match imported {
+                            Ok(library) => {
+                                // The imported library includes the new
+                                // asset; adopt it wholesale.
+                                app.library = library;
+                                app.library_notice = None;
+                                app.load_asset_images(cx);
+                            }
+                            Err(_) => {
+                                app.library_notice = Some(
+                                    "Could not import the image. It may be damaged or unsupported."
+                                        .into(),
+                                );
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Places `asset` centered on the current page at ~25% page width,
+    /// selected and ready to drag (plan.md §12) — one undoable command.
+    pub(crate) fn place_asset(&mut self, id: AssetId, cx: &mut Context<Self>) {
+        let Some(asset) = self.library.asset(id) else {
+            return;
+        };
+        let aspect = asset.aspect();
+        if let OpenState::Opened(opened) = &mut self.open {
+            let page_index = opened.viewer.current_page() as usize;
+            if let Some(page) = opened.session.document().pages().get(page_index) {
+                let object = DocumentObject::image(ImageObject::centered_on_page(page, id, aspect));
+                let object_id = object.id();
+                opened
+                    .session
+                    .execute(Box::new(AddObject::new(page.id(), object)));
+                opened.selected_object = Some(object_id);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Escape: clears the object selection (plan.md §15).
+    fn handle_clear_selection(&mut self, cx: &mut Context<Self>) {
+        if let OpenState::Opened(opened) = &mut self.open
+            && opened.selected_object.take().is_some()
+        {
+            cx.notify();
         }
     }
 
@@ -142,6 +288,7 @@ impl MarkApp {
                             session: DocumentSession::new(document),
                             pdf: None,
                             viewer,
+                            selected_object: None,
                         }))
                     }
                     Err(_) => OpenState::Failed { name },
@@ -182,6 +329,7 @@ impl MarkApp {
                             session: DocumentSession::new(loaded.document),
                             pdf: Some(handle),
                             viewer: ViewerState::new_pdf(page_sizes),
+                            selected_object: None,
                         }));
                         cx.notify();
                         // The viewport is still unknown; the canvas probe
@@ -449,6 +597,13 @@ impl Render for MarkApp {
             OpenState::Opened(opened) => opened.viewer.zoom_percent(),
             _ => None,
         };
+        // Owned snapshots built under immutable borrows, so the mutable
+        // `&mut self.open` match below never conflicts with library reads.
+        let library = assets::LibrarySnapshot {
+            assets: self.library.assets().to_vec(),
+            images: self.asset_images.clone(),
+            notice: self.library_notice.clone(),
+        };
 
         focus_scope("mark")
             .track_focus(&self.focus_handle)
@@ -470,6 +625,9 @@ impl Render for MarkApp {
             .on_action(cx.listener(|this, _: &ZoomInAction, _window, cx| this.handle_zoom_in(cx)))
             .on_action(cx.listener(|this, _: &ZoomOutAction, _window, cx| this.handle_zoom_out(cx)))
             .on_action(cx.listener(|this, _: &ZoomFitAction, _window, cx| this.handle_zoom_fit(cx)))
+            .on_action(cx.listener(|this, _: &ClearSelectionAction, _window, cx| {
+                this.handle_clear_selection(cx)
+            }))
             .flex()
             .flex_col()
             .size_full()
@@ -488,7 +646,7 @@ impl Render for MarkApp {
                     Some("The file may be damaged or in an unsupported format."),
                 )
                 .into_any_element(),
-                OpenState::Opened(opened) => workspace(&theme, opened, window, cx),
+                OpenState::Opened(opened) => workspace(&theme, opened, &library, window, cx),
             })
             .children(match &self.open {
                 OpenState::Opened(opened) => Some(status_bar(
@@ -505,15 +663,41 @@ impl Render for MarkApp {
     }
 }
 
-/// The document workspace: thumbnail sidebar beside the canvas stage
-/// (plan.md §10; the assets panel arrives in Phase 6).
+/// The document workspace: thumbnail sidebar, canvas stage with placed
+/// objects, and the assets panel (plan.md §10).
 fn workspace(
     theme: &Theme,
     opened: &mut OpenedDocument,
+    library: &assets::LibrarySnapshot,
     window: &mut Window,
     cx: &mut Context<MarkApp>,
 ) -> gpui_kit::AnyElement {
     let weak = cx.weak_entity();
+    let page_index = opened.viewer.current_page() as usize;
+    let page = opened.session.document().pages().get(page_index);
+    let selected = opened.selected_object;
+    // Placed objects of the current page, resolved to cached bitmaps: the
+    // canvas draws page → objects → selection in one pass (plan.md §13).
+    let placed: Vec<canvas::PlacedObject> = page
+        .map(|page| {
+            page.objects()
+                .iter()
+                .map(|object| {
+                    let mark_core::ObjectKind::Image(data) = object.kind();
+                    canvas::PlacedObject {
+                        x: data.x,
+                        y: data.y,
+                        width: data.width,
+                        height: data.height,
+                        opacity: data.opacity,
+                        image: library.images.get(&data.asset_id).cloned(),
+                        selected: selected == Some(object.id()),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     div()
         .id("mark-workspace")
         .flex()
@@ -522,7 +706,8 @@ fn workspace(
         .items_stretch()
         .overflow_hidden()
         .child(thumbnails::sidebar(theme, &opened.viewer, window, cx))
-        .child(canvas::stage(theme, &weak, &mut opened.viewer, cx))
+        .child(canvas::stage(theme, &weak, &mut opened.viewer, &placed, cx))
+        .child(assets::panel(theme, library, window, cx))
         .into_any_element()
 }
 

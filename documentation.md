@@ -29,6 +29,41 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-03 — Phase 6 complete: signature library — assets panel, PNG-normalized import, click placement
+
+**Context:**
+
+Phase 6 of `plan.md` §24: the signature/stamp asset library (§12) — import with normalized PNG copy into app-managed storage (§9.3), the assets panel beside the canvas (§10), and placing an asset centered on the current page, selected, ready to drag.
+
+**Actions:**
+
+- `mark-core`: `Asset` gains `pixel_width`/`pixel_height` (+ `aspect()`) so placement computes geometry without decoding the image, and `Asset::from_parts` + `AssetId::parse` reconstruct persisted assets with their original identity.
+- `platform`: `app_data_dir()` via `dirs` (`~/.local/share/mark` on Linux, platform-appropriate elsewhere) and `FilePicker::pick_open_image` (png/jpg/jpeg/webp filter, separate from document opening).
+- `mark-export` (was a stub): `library` module — `AssetLibrary::open` (missing dir/manifest = fresh empty library; a parseable-but-corrupt manifest is an `Err`, never silently replaced), `import` (decode via mark-image → RGBA → save `<id>.png` under `assets/` → atomic manifest write via tmp+rename; the asset id doubles as the filename), `load_image`/`load_asset_image` for rendering. Manifest: versioned JSON (`library.json`) with id/name/kind/file/dims per asset. 6 tests: fresh-open, PNG normalization with alpha preserved (byte-level PNG magic + pixel equality), JPEG→PNG normalization, two imports keep both, damaged manifest errors, failed import leaves no side effects.
+- `app`: new `assets.rs` panel — Signature and Stamp sections (Lucide `signature`/`stamp` icons exist in the pinned asset set), per-section `+` import button, aspect-correct previews from a per-frame `LibrarySnapshot` (owned assets+images+notice, so the mutable `&mut self.open` render match never conflicts with library reads), hover state, click → `place_asset`. `MarkApp` holds `library`/`library_notice`/`asset_images`; damaged library degrades to a session-only temp library behind a notice (§17 copy: "The signature library could not be read."). Import runs decode/encode on the background executor, then adopts the reloaded library wholesale. Asset bitmaps load lazily per missing id at startup and after import.
+- Placement: `place_asset` builds `ImageObject::centered_on_page` (~25% page width, aspect from asset dims) → `DocumentObject::image` → `session.execute(AddObject)` — one undoable command from the first placement (§14), `selected_object` set on `OpenedDocument`. Canvas draws objects over the page through the same `ViewTransform` (`PlacedObject` list built in `workspace`): bitmap at document→screen rect, dashed placeholder while the bitmap decodes, accent outline + rounding on the selected object (§13; handles/drag arrive in Phase 7). `Escape` clears the selection (§15; new `ClearSelection` action + binding).
+- Workspace deps: `serde` (derive), `serde_json`, `dirs 6` (all in the vendored registry cache — no new downloads); mark-export dev-dep `tempfile 3`.
+
+**Decisions:**
+
+- `dirs` instead of plan.md §21's literal `directories`: identical platform-dir semantics and already in the local registry cache (offline-friendly); deviation flagged here per the documentation protocol.
+- Library persistence lives in mark-export (Layer D "persistence/export" per §3) with the directory injected — mark-export stays platform-glue-free and therefore in the mac/win CI domain set.
+- Import re-opens the library from disk inside the background task and the app adopts the result wholesale: no shared mutable state crosses threads, and sequential imports stay consistent because each reads the just-persisted manifest.
+- The render loop borrows: library state is snapshotted (cloned `Vec<Asset>` + Arc'd images) under an immutable borrow before the `&mut self.open` match — one explicit pattern instead of entangling panel data with document mutation.
+- `PlacedObject` deliberately carries no id yet (warning-free at `-D warnings`); Phase 7 reintroduces identity with hit-testing, where it earns its place.
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 65 passed (6 new library tests), 0 failed.
+- Native (Omarchy): seeded `~/.local/share/mark` (python manifest + magenta signature 320×120 with 240×40 content, cyan stamp circle) → `mark letter-portrait.pdf`: pixel-classified screenshot shows the panel beside the canvas with previews at exact geometry — signature content 116×19 physical (predicted 115×19.2 for a 96×36 logical box), stamp circle 40×40 (predicted 40.3); page quadrant and fit zoom re-fitted correctly for the narrower canvas. Empty launch with no library dir: exit 124 (alive at kill), fresh-empty library path exercised.
+- Manual checks outstanding (no click-synthesis tool on this system; ydotool install declined): portal import dialog end-to-end, click-to-place on canvas, Escape clears selection. Placement logic itself is covered by mark-core tests (`centered_on_page` since Phase 2, `AddObject` undo round-trip).
+
+**Next:**
+
+1. Phase 7: object manipulation + undo/redo — click-select on canvas, drag (`MoveObject` per gesture, one command per drag), corner-resize aspect-locked (`ResizeObject`), delete, Ctrl+Z/Ctrl+Shift+Z wiring; rotation optionally at phase end.
+2. Phase 7 will need synthetic pointer events for native verification — evaluate installing ydotool (via Omarchy's own `omarchy-dev-install-ydoo`) or gpui-kit headless UI testing (plan.md §20.4).
+
 ### 2026-10-03 — Phase 5 complete: page viewer — thumbnails, navigation, zoom/pan/fit
 
 **Context:**
