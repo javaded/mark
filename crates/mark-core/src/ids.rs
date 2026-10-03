@@ -15,6 +15,11 @@ macro_rules! entity_id {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
+
+            /// Parses a persisted identifier; `None` when malformed.
+            pub fn parse(s: &str) -> Option<Self> {
+                s.parse().ok().map(Self)
+            }
         }
 
         impl Default for $name {

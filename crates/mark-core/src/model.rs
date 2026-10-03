@@ -195,21 +195,53 @@ impl ImageObject {
 }
 
 /// A reusable signature/stamp asset in the user's library (plan.md §12).
+///
+/// `pixel_width`/`pixel_height` are the normalized PNG's dimensions — enough
+/// to compute the placement aspect without decoding the image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
     id: AssetId,
     name: String,
     kind: AssetKind,
     image_path: PathBuf,
+    pixel_width: u32,
+    pixel_height: u32,
 }
 
 impl Asset {
-    pub fn new(name: impl Into<String>, kind: AssetKind, image_path: PathBuf) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        kind: AssetKind,
+        image_path: PathBuf,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Self {
         Self {
             id: AssetId::new(),
             name: name.into(),
             kind,
             image_path,
+            pixel_width,
+            pixel_height,
+        }
+    }
+
+    /// Reconstructs a persisted asset with its original identity.
+    pub fn from_parts(
+        id: AssetId,
+        name: String,
+        kind: AssetKind,
+        image_path: PathBuf,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            kind,
+            image_path,
+            pixel_width,
+            pixel_height,
         }
     }
 
@@ -227,6 +259,19 @@ impl Asset {
 
     pub fn image_path(&self) -> &Path {
         &self.image_path
+    }
+
+    pub fn pixel_width(&self) -> u32 {
+        self.pixel_width
+    }
+
+    pub fn pixel_height(&self) -> u32 {
+        self.pixel_height
+    }
+
+    /// Width/height ratio for placement sizing (aspect preserved).
+    pub fn aspect(&self) -> f32 {
+        self.pixel_width as f32 / self.pixel_height.max(1) as f32
     }
 }
 

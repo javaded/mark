@@ -316,13 +316,16 @@ fn assets_carry_identity_and_kind() {
         "Javad signature",
         AssetKind::Signature,
         PathBuf::from("/data/assets/sig.png"),
+        320,
+        120,
     );
     assert_eq!(asset.kind().label(), "Signature");
     assert_eq!(asset.name(), "Javad signature");
     assert_eq!(asset.image_path(), Path::new("/data/assets/sig.png"));
+    assert!((asset.aspect() - 320. / 120.).abs() < 1e-6);
     assert_ne!(
         asset.id(),
-        Asset::new("x", AssetKind::Stamp, PathBuf::new()).id()
+        Asset::new("x", AssetKind::Stamp, PathBuf::new(), 1, 1).id()
     );
 }
 

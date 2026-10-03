@@ -14,6 +14,7 @@ path = "src/main.rs"
 gpui-kit.workspace = true
 gpui-omarchy.workspace = true
 mark-core.workspace = true
+mark-export.workspace = true
 mark-image.workspace = true
 mark-pdf.workspace = true
 platform.workspace = true
