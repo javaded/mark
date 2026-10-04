@@ -4,4 +4,5 @@
 //! document (Phase 9) and persists the signature/stamp asset library
 //! ([`library`], Phase 6). Never overwrites the original input.
 
+pub mod export;
 pub mod library;

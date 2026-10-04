@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use image::{Rgba, RgbaImage};
 use pdfium_render::prelude::Pdfium;
 
-pub fn pdfium_or_skip() -> Option<Pdfium> {
+pub fn pdfium_or_skip() -> Option<&'static Pdfium> {
     let pdfium = mark_pdf::bind::try_bind();
     if pdfium.is_none() {
         eprintln!("skipping: no PDFium runtime (run script/fetch-pdfium.sh)");

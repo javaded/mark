@@ -16,9 +16,11 @@
 pub mod bind;
 mod document;
 mod error;
+pub mod export;
 mod geometry;
 mod render;
 mod worker;
-pub use error::{LoadPdfError, RenderPageError};
+pub use error::{ExportPdfError, LoadPdfError, RenderPageError};
+pub use export::{ExportProgress, ImageOverlay, PdfExport};
 pub use render::RenderedPage;
 pub use worker::{LoadedPdf, PdfDocumentHandle, PdfWorker};
