@@ -19,12 +19,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use futures_channel::oneshot;
+use futures_channel::{mpsc as async_mpsc, oneshot};
 use mark_core::{Document, PageGeometry};
 
 use crate::bind;
 use crate::document::load_pdf;
-use crate::error::{LoadPdfError, RenderPageError};
+use crate::error::{ExportPdfError, LoadPdfError, RenderPageError};
+use crate::export::{self, ExportProgress, PdfExport};
 use crate::render::{self, RenderedPage};
 
 /// Opaque handle to a document opened on the worker thread.
@@ -59,6 +60,11 @@ enum Request {
         page_index: u32,
         target_width_px: u32,
         reply: oneshot::Sender<Result<RenderedPage, RenderPageError>>,
+    },
+    Export {
+        export: PdfExport,
+        progress: async_mpsc::UnboundedSender<ExportProgress>,
+        reply: oneshot::Sender<Result<(), ExportPdfError>>,
     },
     Close {
         document: PdfDocumentHandle,
@@ -114,6 +120,26 @@ impl PdfWorker {
     pub fn close(&self, document: PdfDocumentHandle) {
         let _ = self.requests.send(Request::Close { document });
     }
+
+    /// Exports a signed copy of `export.source` to `export.destination`
+    /// (plan.md §16.1). Returns the progress stream and the awaitable
+    /// final result; the document open in the editor is untouched.
+    pub fn export(
+        &self,
+        export: PdfExport,
+    ) -> (
+        async_mpsc::UnboundedReceiver<ExportProgress>,
+        oneshot::Receiver<Result<(), ExportPdfError>>,
+    ) {
+        let (progress_tx, progress_rx) = async_mpsc::unbounded();
+        let (reply, received) = oneshot::channel();
+        let _ = self.requests.send(Request::Export {
+            export,
+            progress: progress_tx,
+            reply,
+        });
+        (progress_rx, received)
+    }
 }
 
 fn run(inbox: mpsc::Receiver<Request>) {
@@ -128,11 +154,17 @@ fn run(inbox: mpsc::Receiver<Request>) {
                 Request::RenderPage { reply, .. } => {
                     let _ = reply.send(Err(RenderPageError::WorkerUnavailable));
                 }
+                Request::Export { reply, .. } => {
+                    let _ = reply.send(Err(ExportPdfError::RuntimeUnavailable));
+                }
                 Request::Close { .. } => {}
             }
         }
         return;
     };
+    // The shared process-wide instance outlives this thread: documents
+    // borrow it for `'static`, so the map owns them without self-reference.
+    let pdfium: &'static pdfium_render::prelude::Pdfium = pdfium;
 
     let mut documents: HashMap<PdfDocumentHandle, pdfium_render::prelude::PdfDocument> =
         HashMap::new();
@@ -141,7 +173,7 @@ fn run(inbox: mpsc::Receiver<Request>) {
     for request in inbox {
         match request {
             Request::Load { path, reply } => {
-                let _ = reply.send(load(&pdfium, path, &mut documents, &mut next_handle));
+                let _ = reply.send(load(pdfium, path, &mut documents, &mut next_handle));
             }
             Request::RenderPage {
                 document,
@@ -150,6 +182,17 @@ fn run(inbox: mpsc::Receiver<Request>) {
                 reply,
             } => {
                 let _ = reply.send(render(&documents, document, page_index, target_width_px));
+            }
+            Request::Export {
+                export,
+                progress,
+                reply,
+            } => {
+                let result = export::export_pdf(pdfium, &export, |done, total| {
+                    // A closed receiver just drops the update.
+                    let _ = progress.unbounded_send(ExportProgress { done, total });
+                });
+                let _ = reply.send(result);
             }
             Request::Close { document } => {
                 documents.remove(&document);

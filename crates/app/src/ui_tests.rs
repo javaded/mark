@@ -595,3 +595,223 @@ fn duplicate_to_page_menu_copies_to_the_chosen_page(cx: &mut TestAppContext) {
     assert_eq!(page_objects(&fx, cx, 0).len(), 1);
     assert_eq!(page_objects(&fx, cx, 1).len(), 0);
 }
+
+// ----- export (plan.md §16, §20.3) ----------------------------------------------
+
+/// Waits for the export to leave the `Running` state.
+///
+/// PDF exports run on the real PDFium worker thread, which wakes the
+/// foreground task from outside the test thread. With the scheduler's
+/// `allow_parking` opt-in enabled (see the callers), pump the executor
+/// in small steps until the status settles — bounded, so a dead worker
+/// fails the assertions instead of hanging the suite.
+fn wait_until_export_settles(fx: &Fixture, cx: &mut TestAppContext) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        let settled = fx.app.update(cx, |app, _| {
+            !matches!(
+                app.export_status(),
+                Some(crate::app::ExportStatus::Running { .. })
+            )
+        });
+        if settled || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A test PDF fixture path under `resources/test-documents/`.
+fn pdf_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../resources/test-documents")
+        .join(name)
+}
+
+#[gpui_kit::test]
+fn export_image_document_writes_composed_png(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+    let (_, placed) = place_signature(&fx, cx);
+    let original_bytes = std::fs::read(&fx.page_path).expect("read original");
+
+    let destination = fx._dir.path().join("page-signed.png");
+    fx.app
+        .update(cx, |app, cx| app.export_to(destination.clone(), cx));
+    cx.run_until_parked();
+
+    // Outcome: done, and the session's dirty state resets (mark_saved).
+    let done = fx.app.update(cx, |app, _| {
+        matches!(
+            app.export_status(),
+            Some(crate::app::ExportStatus::Done { .. })
+        )
+    });
+    assert!(done);
+    fx.app.update(cx, |app, _| {
+        assert!(!app.opened_document().unwrap().session().is_dirty());
+    });
+
+    // The exported PNG: the signature composited at its placement rect,
+    // the base image elsewhere (never a canvas screenshot, §16.1).
+    let exported = image::open(&destination)
+        .expect("exported png readable")
+        .to_rgba8();
+    assert_eq!(exported.dimensions(), (400, 300));
+    let inside = exported.get_pixel(
+        (placed.x + placed.width / 2.) as u32,
+        (placed.y + placed.height / 2.) as u32,
+    );
+    assert_eq!(inside, &image::Rgba([70, 30, 180, 255]), "signature pixels");
+    let outside = exported.get_pixel(10, 10);
+    assert_eq!(outside, &image::Rgba([255, 255, 255, 255]), "base pixels");
+
+    // The original file is byte-identical (plan.md §16).
+    assert_eq!(
+        std::fs::read(&fx.page_path).expect("re-read original"),
+        original_bytes
+    );
+}
+
+#[gpui_kit::test]
+fn export_fails_loudly_when_an_asset_file_is_gone(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+    let _ = place_signature(&fx, cx);
+
+    // The library still lists the asset, but its normalized PNG was
+    // deleted outside the app: the export must fail visibly, never write
+    // a signed copy that silently misses a signature.
+    let asset_file = fx
+        ._dir
+        .path()
+        .join("library")
+        .join(format!("assets/{0}.png", fx.asset_id));
+    std::fs::remove_file(&asset_file).expect("remove asset png");
+
+    let destination = fx._dir.path().join("never-written.png");
+    fx.app
+        .update(cx, |app, cx| app.export_to(destination.clone(), cx));
+    cx.run_until_parked();
+
+    let failed = fx.app.update(cx, |app, _| {
+        matches!(
+            app.export_status(),
+            Some(crate::app::ExportStatus::Failed(_))
+        )
+    });
+    assert!(failed);
+    assert!(!destination.exists(), "a failed export writes nothing");
+}
+
+#[gpui_kit::test]
+fn export_pdf_document_places_real_image_objects(cx: &mut TestAppContext) {
+    // Same graceful skip as mark-pdf's integration tests when no runtime.
+    let Some(pdfium) = mark_pdf::bind::try_bind() else {
+        return;
+    };
+    // This test drives the real PDFium worker thread: its load/render/
+    // export replies wake foreground tasks from off the test thread, so
+    // opt the scheduler into that mix (see wait_until_export_settles).
+    cx.executor().allow_parking();
+    let fx = seeded(cx);
+    let path = pdf_fixture("letter-portrait.pdf");
+    fx.app.update(cx, |app, cx| app.open_path(path, cx));
+    cx.run_until_parked();
+
+    // Sign page 1 with the stamp through the real placement path.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(format!("mark-asset-{}", fx.stamp_id), cx);
+    });
+    let (_, placed) = sole_object(&fx, cx);
+    let original_bytes = std::fs::read(pdf_fixture("letter-portrait.pdf")).expect("read original");
+
+    let destination = fx._dir.path().join("letter-signed.pdf");
+    fx.app
+        .update(cx, |app, cx| app.export_to(destination.clone(), cx));
+    wait_until_export_settles(&fx, cx);
+
+    let done = fx.app.update(cx, |app, _| {
+        matches!(
+            app.export_status(),
+            Some(crate::app::ExportStatus::Done { .. })
+        )
+    });
+    assert!(done, "pdf export finished");
+
+    // Reload the export through the direct binding: the placement became a
+    // real image page object at the display rect mapped to user space
+    // (letter page, no rotation: user_y = 792 − y − h).
+    use pdfium_render::prelude::{PdfPageObjectCommon as _, PdfPageObjectsCommon as _};
+    let pdf = pdfium
+        .load_pdf_from_file(&destination, None)
+        .expect("reload exported pdf");
+    let page = pdf.pages().get(0).expect("page 0");
+    let mut image_objects = 0;
+    for object in page.objects().iter() {
+        if let Some(image) = object.as_image_object() {
+            image_objects += 1;
+            let bounds = image.bounds().expect("image bounds");
+            assert!(
+                (bounds.left().value - placed.x).abs() < 0.5,
+                "left: {} vs {}",
+                bounds.left().value,
+                placed.x
+            );
+            assert!(
+                (bounds.bottom().value - (792. - placed.y - placed.height)).abs() < 0.5,
+                "bottom: {} vs {}",
+                bounds.bottom().value,
+                792. - placed.y - placed.height
+            );
+            assert!(
+                (bounds.width().value - placed.width).abs() < 0.5,
+                "width: {} vs {}",
+                bounds.width().value,
+                placed.width
+            );
+            assert!(
+                (bounds.height().value - placed.height).abs() < 0.5,
+                "height: {} vs {}",
+                bounds.height().value,
+                placed.height
+            );
+        }
+    }
+    assert_eq!(image_objects, 1, "exactly the placed object");
+
+    // The source PDF is untouched.
+    assert_eq!(
+        std::fs::read(pdf_fixture("letter-portrait.pdf")).expect("re-read original"),
+        original_bytes
+    );
+}
+
+#[gpui_kit::test]
+fn export_button_and_progress_surface_exist(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+
+    // No document: no export button.
+    let empty = seeded(cx);
+    with_window(&empty, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-export-button").is_none());
+    });
+
+    // With a document: the button is there and clickable; the status bar
+    // carries the export feedback surface.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-export-button").is_some());
+        assert!(window.try_find("mark-export-status").is_none());
+    });
+    let (_, _) = place_signature(&fx, cx);
+    let destination = fx._dir.path().join("page-signed.png");
+    fx.app
+        .update(cx, |app, cx| app.export_to(destination.clone(), cx));
+    cx.run_until_parked();
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-export-status").is_some());
+    });
+}

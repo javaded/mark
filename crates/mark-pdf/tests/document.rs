@@ -4,8 +4,18 @@
 mod common;
 
 use common::{fixture, pdfium_or_skip};
-use mark_core::PageRotation;
+use mark_core::{PageRotation, Vec2};
 use mark_pdf::{LoadPdfError, PdfWorker};
+
+/// Compares geometry within f32 rounding (PDFium returns 489.6 as
+/// 489.59998 — exact `==` on box dimensions is not a geometry claim).
+fn assert_vec2(actual: Vec2, expected: Vec2, context: &str) {
+    assert!(
+        (actual.x - expected.x).abs() < 0.05 && (actual.y - expected.y).abs() < 0.05,
+        "{context}: expected {expected:?}, got {actual:?}"
+    );
+}
+
 fn load(name: &str) -> mark_pdf::LoadedPdf {
     let worker = PdfWorker::spawn();
     let loaded = pollster::block_on(worker.load(fixture(name)))
@@ -80,9 +90,13 @@ fn crop_box_geometry_reports_origin_and_size() {
     let loaded = load("cropped.pdf");
 
     let geometry = loaded.pages[0];
-    assert_eq!(geometry.origin, mark_core::Vec2::new(61.2, 79.2));
-    assert_eq!(geometry.size, mark_core::Vec2::new(489.6, 633.6));
-    assert_eq!(geometry.display_size(), mark_core::Vec2::new(489.6, 633.6));
+    assert_vec2(geometry.origin, Vec2::new(61.2, 79.2), "crop origin");
+    assert_vec2(geometry.size, Vec2::new(489.6, 633.6), "crop size");
+    assert_vec2(
+        geometry.display_size(),
+        Vec2::new(489.6, 633.6),
+        "crop display size",
+    );
 }
 
 #[test]

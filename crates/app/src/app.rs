@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, TestSupportExt as _, Window, div, rems,
@@ -23,8 +24,9 @@ use mark_core::{
     AddObject, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession, DuplicateObject,
     DuplicateToPage, ImageObject, ObjectId, ObjectKind, Rect, ResizeObject, Vec2,
 };
+use mark_export::export::{PngOverlay, compose_png_page, signed_destination};
 use mark_export::library::AssetLibrary;
-use mark_pdf::{PdfDocumentHandle, PdfWorker, RenderedPage};
+use mark_pdf::{ImageOverlay, PdfDocumentHandle, PdfExport, PdfWorker, RenderedPage};
 
 use crate::assets;
 use crate::canvas;
@@ -32,7 +34,7 @@ use crate::thumbnails;
 use crate::viewer::ViewerState;
 use crate::{
     ClearSelection as ClearSelectionAction, Copy as CopyAction,
-    DeleteSelected as DeleteSelectedAction, Duplicate as DuplicateAction,
+    DeleteSelected as DeleteSelectedAction, Duplicate as DuplicateAction, Export as ExportAction,
     FirstPage as FirstPageAction, LastPage as LastPageAction, NextPage as NextPageAction,
     OpenDocument, Paste as PasteAction, PreviousPage as PreviousPageAction, Redo as RedoAction,
     Undo as UndoAction, ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction, ZoomOut as ZoomOutAction,
@@ -43,6 +45,30 @@ use crate::{
 const DUPLICATE_OFFSET: f32 = 16.;
 /// Each consecutive paste lands one more step out, so repeats cascade.
 const PASTE_STEP: f32 = 16.;
+
+/// One placed object awaiting its asset bytes, in display-space page
+/// coordinates — the format-independent export input (plan.md §16).
+struct OverlaySpec {
+    rect: Rect,
+    asset: AssetId,
+    opacity: f32,
+}
+
+/// Feedback for the export flow (plan.md §16, §6.4): live progress while
+/// the worker writes, then the outcome shown until the next export or
+/// document switch (Phase 10 delivers the richer notification surfaces).
+#[derive(Clone, Debug)]
+pub(crate) enum ExportStatus {
+    /// Pages written / pages total.
+    Running {
+        done: u32,
+        total: u32,
+    },
+    Done {
+        name: SharedString,
+    },
+    Failed(SharedString),
+}
 
 /// Everything needed to display an opened document.
 ///
@@ -106,6 +132,8 @@ pub struct MarkApp {
     /// How many pastes happened since the copy: each lands one step further
     /// out so repeated Ctrl+V never stacks exactly on top (plan.md §13.2).
     paste_count: u32,
+    /// Export feedback: progress while a job runs, then the outcome.
+    export: Option<ExportStatus>,
     /// Keyboard focus for the whole app: actions (navigation, zoom, open)
     /// dispatch through the focused node.
     focus_handle: FocusHandle,
@@ -134,6 +162,7 @@ impl MarkApp {
             asset_images: HashMap::new(),
             clipboard: None,
             paste_count: 0,
+            export: None,
             focus_handle: cx.focus_handle(),
         };
         app.load_asset_images(cx);
@@ -245,6 +274,8 @@ impl MarkApp {
 
     /// Loads `path` as a document, images and PDFs alike, off the UI thread.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // A fresh document resets the previous document's export feedback.
+        self.export = None;
         if is_pdf(&path) {
             self.open_pdf(path, cx);
         } else {
@@ -981,6 +1012,232 @@ impl MarkApp {
         }
     }
 
+    // ----- export (plan.md §16) ---------------------------------------------------
+
+    /// Ctrl+S / header button: asks where to save (default
+    /// `<stem>-signed.<ext>` next to the original, never the original
+    /// itself) and exports the open document.
+    fn handle_export(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.opened_source() else {
+            return;
+        };
+        if self.is_exporting() {
+            return; // one job at a time
+        }
+        let extension = if is_pdf(&source) { "pdf" } else { "png" };
+        let default = signed_destination(&source, extension);
+        let dialogs = platform::NativeFileDialogs;
+        cx.spawn(async move |this, cx| {
+            // Cancelled dialog = cancelled export; nothing was set yet.
+            if let Some(destination) =
+                platform::FilePicker::pick_save_export(&dialogs, default).await
+            {
+                this.update(cx, |app, cx| app.export_to(destination, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The export core (dialog-free so tests drive it directly): snapshot
+    /// the placed objects, then write the signed copy — PDFs through real
+    /// PDFium image page objects on the worker thread (§16.1), image
+    /// documents composited to PNG. The open document is only ever read,
+    /// and the original file is never touched.
+    pub(crate) fn export_to(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
+        let OpenState::Opened(opened) = &self.open else {
+            return;
+        };
+        if self.is_exporting() {
+            return;
+        }
+        let source = opened.session().source().path().to_path_buf();
+        let total = opened.session().document().page_count() as u32;
+        let specs: Vec<Vec<OverlaySpec>> = overlay_specs(opened.session().document());
+
+        // Resolve asset image paths through the live library up front: a
+        // placed asset that is no longer in the library fails the export
+        // loudly instead of silently missing a signature (plan.md §17).
+        let library_root = self.library.root().to_path_buf();
+        let mut asset_paths: HashMap<AssetId, PathBuf> = HashMap::new();
+        for OverlaySpec { asset, .. } in specs.iter().flatten() {
+            if asset_paths.contains_key(asset) {
+                continue;
+            }
+            match self.library.asset(*asset) {
+                Some(asset_entry) => {
+                    asset_paths.insert(*asset, asset_entry.image_path().to_path_buf());
+                }
+                None => {
+                    self.export = Some(ExportStatus::Failed(
+                        "A placed image is missing from the library.".into(),
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        self.export = Some(ExportStatus::Running {
+            done: 0,
+            total: total.max(1),
+        });
+        cx.notify();
+
+        if is_pdf(&source) {
+            self.export_pdf(destination, source, specs, library_root, asset_paths, cx);
+        } else {
+            self.export_image(destination, source, specs, library_root, asset_paths, cx);
+        }
+    }
+
+    /// PDF export: builds the worker job off the UI thread (reading the
+    /// library's normalized PNGs), then tracks progress and the result.
+    fn export_pdf(
+        &mut self,
+        destination: PathBuf,
+        source: PathBuf,
+        specs: Vec<Vec<OverlaySpec>>,
+        library_root: PathBuf,
+        asset_paths: HashMap<AssetId, PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let worker = self.pdf.clone();
+        cx.spawn(async move |this, cx| {
+            // The job owns the paths; keep copies for the finish report.
+            let source_for_finish = source.clone();
+            let destination_for_finish = destination.clone();
+            // Read the assets' normalized PNGs off the UI thread.
+            let job = cx
+                .background_executor()
+                .spawn(async move {
+                    build_pdf_export(source, destination, &specs, &library_root, &asset_paths)
+                })
+                .await;
+            match job {
+                Ok(job) => {
+                    let (mut progress, result) = worker.export(job);
+                    // Progress events all precede the reply, so the stream
+                    // ends exactly when the worker finishes.
+                    while let Some(event) = progress.next().await {
+                        this.update(cx, |app, cx| {
+                            app.note_export_progress(event.done, event.total, cx);
+                        })
+                        .ok();
+                    }
+                    let outcome = match result.await {
+                        Ok(Ok(())) => Ok(()),
+                        _ => Err("The PDF could not be exported."),
+                    };
+                    this.update(cx, |app, cx| {
+                        app.finish_export(outcome, &source_for_finish, destination_for_finish, cx)
+                    })
+                    .ok();
+                }
+                Err(message) => {
+                    this.update(cx, |app, cx| {
+                        app.finish_export(
+                            Err(message),
+                            &source_for_finish,
+                            destination_for_finish,
+                            cx,
+                        )
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Image export: reloads the source bitmap, composites the placed
+    /// objects (plan.md §16 image rule), and writes PNG — all off the UI
+    /// thread.
+    fn export_image(
+        &mut self,
+        destination: PathBuf,
+        source: PathBuf,
+        specs: Vec<Vec<OverlaySpec>>,
+        library_root: PathBuf,
+        asset_paths: HashMap<AssetId, PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            // The job owns the paths; keep copies for the finish report.
+            let source_for_finish = source.clone();
+            let destination_for_finish = destination.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    export_image_file(&source, &destination, &specs, &library_root, &asset_paths)
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                app.finish_export(outcome, &source_for_finish, destination_for_finish, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A progress event arrived from the running export.
+    fn note_export_progress(&mut self, done: u32, total: u32, cx: &mut Context<Self>) {
+        if matches!(self.export, Some(ExportStatus::Running { .. })) {
+            self.export = Some(ExportStatus::Running {
+                done,
+                total: total.max(1),
+            });
+            cx.notify();
+        }
+    }
+
+    /// The export finished: record the outcome and mark the originating
+    /// session saved — dirty-state surfaces arrive in Phase 10, but the
+    /// session bookkeeping starts here.
+    fn finish_export(
+        &mut self,
+        outcome: Result<(), &str>,
+        source: &Path,
+        destination: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Ok(()) => {
+                // Only the document that was exported (the user may have
+                // opened another file while the worker wrote).
+                if let OpenState::Opened(opened) = &mut self.open
+                    && opened.session().source().path() == source
+                {
+                    opened.session.mark_saved();
+                }
+                let name: SharedString = file_name(&destination).into();
+                self.export = Some(ExportStatus::Done { name });
+            }
+            Err(message) => {
+                self.export = Some(ExportStatus::Failed(message.into()));
+            }
+        }
+        cx.notify();
+    }
+
+    fn is_exporting(&self) -> bool {
+        matches!(self.export, Some(ExportStatus::Running { .. }))
+    }
+
+    /// The open document's source path, if any.
+    fn opened_source(&self) -> Option<PathBuf> {
+        match &self.open {
+            OpenState::Opened(opened) => Some(opened.session().source().path().to_path_buf()),
+            _ => None,
+        }
+    }
+
+    /// Export feedback state (test observation).
+    #[cfg(test)]
+    pub(crate) fn export_status(&self) -> Option<&ExportStatus> {
+        self.export.as_ref()
+    }
+
     fn header_title(&self) -> Option<&str> {
         match &self.open {
             OpenState::Opened(opened) => opened.session().source().path().file_name()?.to_str(),
@@ -1007,6 +1264,118 @@ fn is_pdf(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+/// The document's placed objects as per-page overlay specs, in page order
+/// — the export snapshot, taken once before any bytes move.
+fn overlay_specs(document: &mark_core::Document) -> Vec<Vec<OverlaySpec>> {
+    document
+        .pages()
+        .iter()
+        .map(|page| {
+            page.objects()
+                .iter()
+                .filter_map(|object| {
+                    #[allow(irrefutable_let_patterns)]
+                    // Text/Shape variants come later (plan.md §7)
+                    let ObjectKind::Image(data) = object.kind() else {
+                        return None;
+                    };
+                    Some(OverlaySpec {
+                        rect: Rect {
+                            x: data.x,
+                            y: data.y,
+                            width: data.width,
+                            height: data.height,
+                        },
+                        asset: data.asset_id,
+                        opacity: data.opacity,
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Assembles the worker job: every placed object's asset PNG read once,
+/// mapped to its display-space page rect (plan.md §16.1).
+///
+/// Runs off the UI thread; a placed asset whose normalized PNG vanished
+/// from disk fails the export loudly (plan.md §17) instead of silently
+/// writing a signed copy that misses a signature.
+fn build_pdf_export(
+    source: PathBuf,
+    destination: PathBuf,
+    specs: &[Vec<OverlaySpec>],
+    library_root: &Path,
+    asset_paths: &HashMap<AssetId, PathBuf>,
+) -> Result<PdfExport, &'static str> {
+    let mut pngs: HashMap<AssetId, Vec<u8>> = HashMap::new();
+    for (asset, relative) in asset_paths {
+        let bytes = std::fs::read(library_root.join(relative))
+            .map_err(|_| "A placed image could not be read from the library.")?;
+        pngs.insert(*asset, bytes);
+    }
+    let pages = specs
+        .iter()
+        .map(|page| {
+            page.iter()
+                .map(|spec| ImageOverlay {
+                    rect: spec.rect,
+                    png: pngs.get(&spec.asset).expect("spec asset was read").clone(),
+                })
+                .collect()
+        })
+        .collect();
+    Ok(PdfExport {
+        source,
+        destination,
+        pages,
+    })
+}
+
+/// Writes the signed PNG for an image document: the reloaded source bitmap
+/// with every placed object composited at its page rect (image pages are
+/// 1 px = 1 pt, plan.md §8, so point coordinates map 1:1 to pixels).
+fn export_image_file(
+    source: &Path,
+    destination: &Path,
+    specs: &[Vec<OverlaySpec>],
+    library_root: &Path,
+    asset_paths: &HashMap<AssetId, PathBuf>,
+) -> Result<(), &'static str> {
+    let (_, base) = mark_image::ImageDocument::load(source)
+        .map_err(|_| "The document could not be read again for export.")?
+        .into_parts();
+    // Decode each placed asset once, before any borrows of the map.
+    let mut bitmaps: HashMap<AssetId, image::RgbaImage> = HashMap::new();
+    for spec in specs.first().map(|page| page.as_slice()).unwrap_or(&[]) {
+        if bitmaps.contains_key(&spec.asset) {
+            continue;
+        }
+        let path = library_root.join(asset_paths.get(&spec.asset).expect("resolved"));
+        let decoded = mark_image::ImageDocument::load(&path)
+            .map_err(|_| "A placed image could not be read from the library.")?
+            .into_parts()
+            .1;
+        bitmaps.insert(spec.asset, decoded);
+    }
+    let overlays: Vec<PngOverlay<'_>> = specs
+        .first()
+        .map(|page| {
+            page.iter()
+                .map(|spec| PngOverlay {
+                    rect: spec.rect,
+                    image: &bitmaps[&spec.asset],
+                    opacity: spec.opacity,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let composed = compose_png_page(&base, &overlays);
+    composed
+        .save(destination)
+        .map_err(|_| "The exported file could not be written.")
+}
+
 fn file_name(path: &Path) -> &str {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1027,6 +1396,9 @@ impl Render for MarkApp {
             images: self.asset_images.clone(),
             notice: self.library_notice.clone(),
         };
+        let can_export = matches!(self.open, OpenState::Opened(_));
+        let exporting = self.is_exporting();
+        let export_status = self.export.clone();
 
         focus_scope("mark")
             .track_focus(&self.focus_handle)
@@ -1061,11 +1433,21 @@ impl Render for MarkApp {
             )
             .on_action(cx.listener(|this, _: &UndoAction, window, cx| this.handle_undo(window, cx)))
             .on_action(cx.listener(|this, _: &RedoAction, window, cx| this.handle_redo(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &ExportAction, window, cx| this.handle_export(window, cx)),
+            )
             .flex()
             .flex_col()
             .size_full()
             .bg(theme.inset)
-            .child(header(&theme, self.header_title(), zoom_percent, cx))
+            .child(header(
+                &theme,
+                self.header_title(),
+                zoom_percent,
+                can_export,
+                exporting,
+                cx,
+            ))
             .child(match &mut self.open {
                 OpenState::Empty => empty_workspace(&theme, cx).into_any_element(),
                 OpenState::Opening { name } => {
@@ -1089,6 +1471,7 @@ impl Render for MarkApp {
                     opened.viewer.has_previous_page(),
                     opened.viewer.has_next_page(),
                     zoom_percent,
+                    export_status.as_ref(),
                     cx,
                 )),
                 _ => None,
@@ -1314,10 +1697,13 @@ fn selection_toolbar(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn header(
     theme: &Theme,
     title: Option<&str>,
     zoom_percent: Option<u32>,
+    can_export: bool,
+    exporting: bool,
     cx: &mut Context<MarkApp>,
 ) -> impl IntoElement {
     div()
@@ -1410,12 +1796,38 @@ fn header(
                             ),
                             "Fit page (0)",
                         ))
-                })),
+                }))
+                .children(export_button(can_export, exporting, cx)),
         )
 }
 
-/// Status bar: page navigation and indication on the left, zoom on the
-/// right (plan.md §10).
+/// The header's Export control (plan.md §10): primary action, hidden
+/// without a document, disabled while an export runs.
+fn export_button(
+    can_export: bool,
+    exporting: bool,
+    cx: &mut Context<MarkApp>,
+) -> Option<impl IntoElement> {
+    can_export.then(|| {
+        let export_hint = if cfg!(target_os = "macos") {
+            "Export (⌘S)"
+        } else {
+            "Export (Ctrl+S)"
+        };
+        gpui_omarchy::with_tooltip(
+            button("mark-export-button", "Export", ButtonVariant::Primary, cx)
+                .disabled(exporting)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.handle_export(window, cx);
+                })),
+            export_hint,
+        )
+    })
+}
+
+/// Status bar: page navigation and indication on the left; export
+/// feedback and zoom on the right (plan.md §10, §16).
+#[allow(clippy::too_many_arguments)]
 fn status_bar(
     theme: &Theme,
     current_page: u32,
@@ -1423,6 +1835,7 @@ fn status_bar(
     has_previous: bool,
     has_next: bool,
     zoom_percent: Option<u32>,
+    export_status: Option<&ExportStatus>,
     cx: &mut Context<MarkApp>,
 ) -> impl IntoElement {
     div()
@@ -1505,10 +1918,35 @@ fn status_bar(
         )
         .child(
             div()
-                .id("mark-status-zoom")
-                .text_size(rems(0.75))
-                .text_color(theme.secondary)
-                .child(zoom_percent.map(|p| format!("{p}%")).unwrap_or_default()),
+                .id("mark-status-right")
+                .flex()
+                .items_center()
+                .gap(rems(0.5))
+                .children(export_status.map(|status| {
+                    let text = match status {
+                        ExportStatus::Running { done, total } => {
+                            format!("Exporting… {done}/{total}")
+                        }
+                        ExportStatus::Done { name } => format!("Exported {name}"),
+                        ExportStatus::Failed(message) => format!("Export failed. {message}"),
+                    };
+                    div()
+                        .id("mark-export-status")
+                        .test_support()
+                        .text_size(rems(0.75))
+                        .text_color(match status {
+                            ExportStatus::Failed(_) => theme.danger,
+                            _ => theme.secondary,
+                        })
+                        .child(text)
+                }))
+                .child(
+                    div()
+                        .id("mark-status-zoom")
+                        .text_size(rems(0.75))
+                        .text_color(theme.secondary)
+                        .child(zoom_percent.map(|p| format!("{p}%")).unwrap_or_default()),
+                ),
         )
 }
 

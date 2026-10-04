@@ -19,9 +19,15 @@ mark-image.workspace = true
 mark-pdf.workspace = true
 platform.workspace = true
 image.workspace = true
+# StreamExt over the export worker's progress channel (already in the
+# dependency tree via gpui; no new external code).
+futures = "0.3"
 
 [dev-dependencies]
 # Same source and version as the normal dependency (test doc rule), with
 # the headless UI-testing helpers enabled (plan.md §20.4).
 gpui-kit = { version = "=0.7.0", default-features = false, features = ["assets", "test-support"] }
+# Export verification in UI tests reloads the written file through the
+# direct binding (plan.md §20.3); same pin as mark-pdf.
+pdfium-render = "0.9"
 tempfile = "3"

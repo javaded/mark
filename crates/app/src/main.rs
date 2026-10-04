@@ -22,6 +22,7 @@ gpui_kit::actions!(
     [
         Quit,
         OpenDocument,
+        Export,
         NextPage,
         PreviousPage,
         FirstPage,
@@ -90,6 +91,9 @@ fn init_keybindings(cx: &mut gpui_kit::App) {
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-q"), Quit, None),
         KeyBinding::new(&format!("{modifier}-o"), OpenDocument, None),
+        // Export (plan.md §15: Ctrl+S is export — the MVP has no separate
+        // save-to-output-path semantics).
+        KeyBinding::new(&format!("{modifier}-s"), Export, None),
         // Page navigation (plan.md §15).
         KeyBinding::new("pageup", PreviousPage, None),
         KeyBinding::new("pagedown", NextPage, None),

@@ -21,3 +21,15 @@ pub enum RenderPageError {
     #[error("the PDF engine is unavailable")]
     WorkerUnavailable,
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExportPdfError {
+    #[error("the PDF could not be exported")]
+    Pdfium(#[from] pdfium_render::prelude::PdfiumError),
+    #[error("an overlay image could not be decoded")]
+    Image(#[from] image::ImageError),
+    #[error("the PDFium runtime could not be loaded")]
+    RuntimeUnavailable,
+    #[error("the PDF engine is unavailable")]
+    WorkerUnavailable,
+}

@@ -8,7 +8,7 @@
 //! substitute a fake picker; native dialogs never run in tests (plan.md
 //! §20.5).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rfd::AsyncFileDialog;
 
@@ -35,6 +35,13 @@ pub trait FilePicker {
     /// Resolves to `None` when the dialog is cancelled.
     #[allow(async_fn_in_trait)]
     async fn pick_open_image(&self) -> Option<PathBuf>;
+
+    /// Asks the user where to save the exported document, starting from
+    /// `default_name` in the source's directory (plan.md §16).
+    ///
+    /// Resolves to `None` when the dialog is cancelled.
+    #[allow(async_fn_in_trait)]
+    async fn pick_save_export(&self, default_name: PathBuf) -> Option<PathBuf>;
 }
 
 /// Native file dialogs via `rfd`.
@@ -64,5 +71,36 @@ impl FilePicker for NativeFileDialogs {
             .pick_file()
             .await
             .map(|file| file.path().to_path_buf())
+    }
+
+    async fn pick_save_export(&self, default_name: PathBuf) -> Option<PathBuf> {
+        let filter = if default_name.extension().and_then(|e| e.to_str()) == Some("pdf") {
+            vec!["pdf"]
+        } else {
+            vec!["png"]
+        };
+        let name = default_name.file_name()?.to_str()?.to_owned();
+        let directory = default_name.parent().map(Path::to_path_buf);
+        let mut dialog = AsyncFileDialog::new()
+            .set_title("Export signed document")
+            .add_filter(filter_name(&filter), &filter)
+            .set_file_name(name);
+        if let Some(directory) = directory
+            && !directory.as_os_str().is_empty()
+        {
+            dialog = dialog.set_directory(directory);
+        }
+        dialog
+            .save_file()
+            .await
+            .map(|file| file.path().to_path_buf())
+    }
+}
+
+/// Display name for a save-dialog filter list.
+fn filter_name(extensions: &[&str]) -> String {
+    match extensions {
+        ["pdf"] => "PDF document".to_owned(),
+        _ => "PNG image".to_owned(),
     }
 }
