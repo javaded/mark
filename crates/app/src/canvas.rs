@@ -76,12 +76,15 @@ pub(crate) fn render_image(rgba: &image::RgbaImage) -> RenderImage {
 }
 
 /// The document stage: viewport probe, the page bitmap positioned by the
-/// view transform, the objects placed on it, and the pan interactions.
+/// view transform, the objects placed on it, the pan interactions, and the
+/// floating selection toolbar (§13).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage(
     theme: &Theme,
     weak: &WeakEntity<MarkApp>,
     viewer: &mut ViewerState,
     placed: &[PlacedObject],
+    toolbar: Option<AnyElement>,
     cx: &mut Context<MarkApp>,
 ) -> impl IntoElement {
     let page = viewer.current_page();
@@ -152,8 +155,8 @@ pub(crate) fn stage(
                 // handlers stop propagation first.
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                        this.clear_selection_if_idle(cx);
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.clear_selection_if_idle(window, cx);
                     }),
                 )
                 .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
@@ -209,6 +212,9 @@ pub(crate) fn stage(
                     }),
                 ),
         )
+        // The contextual toolbar floats above the viewport: its presses
+        // never reach the canvas below, so the selection survives.
+        .children(toolbar)
 }
 
 /// The stage content: the positioned page with its placed objects, or the

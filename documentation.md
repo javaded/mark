@@ -29,6 +29,43 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-04 — Phase 8 complete: multi-object / multi-page workflow — duplicate, copy/paste, "To page…", contextual toolbar
+
+**Context:**
+
+Phase 8 of `plan.md` §24 (§13.1, §13.2): multiple objects and assets, duplicate (Ctrl+D), copy/paste with offset, and "Duplicate to page…" — the `DuplicateObject`/`DuplicateToPage` commands have existed in mark-core since Phase 2; this phase wired them into the UI and delivered the §13 contextual toolbar considered in Phase 7's Next.
+
+**Actions:**
+
+- `main.rs`: `Copy`/`Paste`/`Duplicate` actions + §15 keybindings (`ctrl/cmd-c`, `-v`, `-d`).
+- `app.rs` handlers, each committing exactly one command (§14): `handle_duplicate` → `DuplicateObject` (offset 16 pt, duplicate selected and returned by reading the command's fresh id); `handle_copy`/`handle_paste` — app-level clipboard holding the copied `ImageObject`; paste = `AddObject` on the *current* page at the copy's position + 16 pt × consecutive-paste count (cascade, §13.2 "never exactly on top"), clamped fully onto the page; `duplicate_to_page(page_index)` → `DuplicateToPage` with the copy clamped onto the *target* page's bounds (smaller pages pull the position in), source stays selected, same-page targets rejected (that's Duplicate's job); `handle_resize_selected(factor)` → `ResizeObject` scaled about the center, aspect preserved, 16 pt minimum, page-clamped, no-op steps (already page-filling) commit nothing.
+- Contextual toolbar (`selection_toolbar`, plan.md §13): appears floating top-right over the canvas whenever an object is selected — kind label (Signature/Stamp/… from the library), `−`/`+` size steps (0.9×/1.1×), "Duplicate" (tooltip carries the Ctrl+D hint), "To page…" (hidden on single-page documents), Delete. Built from gpui-omarchy `button`/`icon_button`/`menu`; the page menu lists every page with the current page disabled + checked, and row order equals page order so the menu index *is* the page index. Rotate from the §13 mock deliberately omitted (see Decisions).
+- The toolbar stops pointer-down propagation: a bubbling press hits the viewport's clear-selection handler and unmounts the toolbar mid-press — the same trap Phase 7 fixed for resize handles, this time caught headlessly before any human saw it.
+- Focus reclamation: clicking a toolbar control focuses it; when the selection clears (Escape, Delete, click-away, undo of a placement) the toolbar unmounts and its focused control dies with it, after which keyboard actions stopped dispatching. Every selection→None path now returns focus to the app scope (`reclaim_focus`). Caught by the UI test as a dead Ctrl+Z after Escape.
+- `manipulation.rs`: two pure helpers + 4 unit tests — `clamped_into_page` (overshoot pulls back inside; oversized anchors top-left) and `scaled_about_center` (center-anchored uniform scaling with 16 pt/page clamps).
+- UI tests (`ui_tests.rs`, 6 new): Ctrl+D offset + fresh id + undo; copy/paste cascade (16/32 pt steps) + double-undo; toolbar size steps (exact 1.1×/0.9× about the center, aspect, undo round-trip) and toolbar visibility toggling with Escape; toolbar Duplicate + Delete buttons; two different assets placed independently with their own aspects; "To page…" driven through the real menu — trigger click, test-clock advance past the 140 ms popup fade (popover content is invisible at opacity 0 and the click API asserts visibility), `("menu-item", 1)` click — asserting the copy's exact clamped geometry on a smaller (120×80) target page and undo removing only the copy.
+- Test infrastructure: `Fixture` now seeds a second 120×120 stamp asset and retains the page path; `MarkApp::open_test_document` (`#[cfg(test)]`) injects a multi-page document directly — `ViewerState` in pdf mode with no worker handle, so zero render requests are issued and model-level assertions need no PDFium runtime.
+
+**Decisions:**
+
+- Paste is `AddObject`, not `DuplicateObject`: the copied source may since have been deleted, moved, or live in another document — `DuplicateObject::apply` resolves the *source's* page, which paste cannot depend on. The clipboard holds the asset reference (library assets are app-global), so pasting across documents is coherent by construction.
+- Toolbar omits Rotate: the canvas does not render `ImageObject.rotation` yet, and a button whose committed command is invisible on screen is worse than no button. Rotate arrives with rotation rendering (future polish).
+- Toolbar omits the §13 "100%" readout: no baseline size is tracked to compute a percentage against; tooltips ("Smaller (−10%)" / "Bigger (+10%)") carry the meaning instead.
+- "Duplicate to page…" labeled "To page…" — it sits directly beside the "Duplicate" button, which supplies the verb (§13.1's full label would duplicate the adjacent button's text).
+- Page menu lists every page (no virtualization): correct and keyboard-navigable at any size; a virtualized picker is deferred until real long-document need (§11.3 pressure belongs to rendering, which is already lazy).
+- The focus-reclaim is unconditional on selection→None transitions (focusing an already-focused app scope is a no-op) rather than tracking "focus was in the toolbar" — one rule, no bookkeeping.
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 90 passed (4 manipulation + 6 UI integration new), 0 failed.
+- Native (Omarchy): `mark mixed-sizes.pdf` → exit 124 (alive at kill); screenshot pixel-sampling shows the full workspace rendered (103 distinct sampled colors across a 929×1000 crop — thumbnails, canvas, panel all present; no blank/crash frame). Toolbar and menu interaction remain headless-verified (no pointer synthesis on this system, same caveat class as Phase 7).
+
+**Next:**
+
+1. Phase 9 — PDF export (most important milestone): PDFium image page objects on the worker thread, `PageCoordinateMapper`-driven coordinates, external-viewer verification with all §20.3 fixtures, progress UI.
+2. During Phase 9 polish, consider "duplicated to page N" feedback (toast/notice) — no notification surface exists yet (Phase 10's error surfaces may deliver it).
+
 ### 2026-10-04 — Phase 7 complete: object manipulation + undo/redo, headless UI integration tests
 
 **Context:**
