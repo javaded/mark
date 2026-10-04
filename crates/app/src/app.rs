@@ -12,13 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::{
-    ClickEvent, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Window, div, rems,
+    AnyElement, ClickEvent, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, Styled as _, TestSupportExt as _, Window, div, rems,
 };
-use gpui_omarchy::{ActiveTheme, ButtonVariant, IconName, Theme, button, focus_scope, icon};
+use gpui_omarchy::{
+    ActiveTheme, ButtonVariant, IconName, MenuItem, Theme, button, focus_scope, icon, icon_button,
+    menu, with_tooltip,
+};
 use mark_core::{
-    AddObject, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession, ImageObject,
-    ObjectId, Rect, Vec2,
+    AddObject, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession, DuplicateObject,
+    DuplicateToPage, ImageObject, ObjectId, ObjectKind, Rect, ResizeObject, Vec2,
 };
 use mark_export::library::AssetLibrary;
 use mark_pdf::{PdfDocumentHandle, PdfWorker, RenderedPage};
@@ -28,11 +31,18 @@ use crate::canvas;
 use crate::thumbnails;
 use crate::viewer::ViewerState;
 use crate::{
-    ClearSelection as ClearSelectionAction, DeleteSelected as DeleteSelectedAction,
+    ClearSelection as ClearSelectionAction, Copy as CopyAction,
+    DeleteSelected as DeleteSelectedAction, Duplicate as DuplicateAction,
     FirstPage as FirstPageAction, LastPage as LastPageAction, NextPage as NextPageAction,
-    OpenDocument, PreviousPage as PreviousPageAction, Redo as RedoAction, Undo as UndoAction,
-    ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction, ZoomOut as ZoomOutAction,
+    OpenDocument, Paste as PasteAction, PreviousPage as PreviousPageAction, Redo as RedoAction,
+    Undo as UndoAction, ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction, ZoomOut as ZoomOutAction,
 };
+
+/// How far a duplicate or the first paste lands from its source, in page
+/// units (plan.md §13.2: offset near the selection, never exactly on top).
+const DUPLICATE_OFFSET: f32 = 16.;
+/// Each consecutive paste lands one more step out, so repeats cascade.
+const PASTE_STEP: f32 = 16.;
 
 /// Everything needed to display an opened document.
 ///
@@ -90,6 +100,12 @@ pub struct MarkApp {
     library_notice: Option<SharedString>,
     /// Decoded asset bitmaps for the panel and canvas, keyed by asset.
     asset_images: HashMap<AssetId, Arc<gpui_kit::RenderImage>>,
+    /// The copied object (Ctrl+C), pastable onto any page of any open
+    /// document (plan.md §13.2).
+    clipboard: Option<ImageObject>,
+    /// How many pastes happened since the copy: each lands one step further
+    /// out so repeated Ctrl+V never stacks exactly on top (plan.md §13.2).
+    paste_count: u32,
     /// Keyboard focus for the whole app: actions (navigation, zoom, open)
     /// dispatch through the focused node.
     focus_handle: FocusHandle,
@@ -116,6 +132,8 @@ impl MarkApp {
             library,
             library_notice: notice,
             asset_images: HashMap::new(),
+            clipboard: None,
+            paste_count: 0,
             focus_handle: cx.focus_handle(),
         };
         app.load_asset_images(cx);
@@ -187,6 +205,30 @@ impl MarkApp {
             OpenState::Opened(opened) => Some(opened),
             _ => None,
         }
+    }
+
+    /// Replaces the open document wholesale (UI-test injection: multi-page
+    /// documents without going through a worker-backed open).
+    #[cfg(test)]
+    pub(crate) fn open_test_document(
+        &mut self,
+        document: mark_core::Document,
+        cx: &mut Context<Self>,
+    ) {
+        let page_sizes = document
+            .pages()
+            .iter()
+            .map(|page| Vec2::new(page.width(), page.height()))
+            .collect();
+        self.open = OpenState::Opened(Box::new(OpenedDocument {
+            session: DocumentSession::new(document),
+            pdf: None,
+            viewer: ViewerState::new_pdf(page_sizes),
+            selected_object: None,
+            press_pointer: None,
+            gesture: None,
+        }));
+        cx.notify();
     }
 
     /// Opens the native file dialog and loads whatever the user picks.
@@ -282,15 +324,23 @@ impl MarkApp {
 
     /// Escape: cancels any in-progress gesture, then clears the object
     /// selection (plan.md §15).
-    fn handle_clear_selection(&mut self, cx: &mut Context<Self>) {
+    fn handle_clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
         if let OpenState::Opened(opened) = &mut self.open {
             changed = opened.gesture.take().is_some();
             changed |= opened.selected_object.take().is_some();
         }
         if changed {
+            Self::reclaim_focus(self, window, cx);
             cx.notify();
         }
+    }
+
+    /// Selection gone → toolbar unmounted: return keyboard focus to the app
+    /// scope so shortcuts keep dispatching (a focused toolbar control dies
+    /// with its toolbar).
+    fn reclaim_focus(&self, window: &mut Window, cx: &mut gpui_kit::App) {
+        window.focus(&self.focus_handle.clone(), cx);
     }
 
     // ----- object manipulation (plan.md §13, §14) --------------------------------
@@ -381,10 +431,11 @@ impl MarkApp {
     /// Canvas click on empty space (no object/handle consumed it): clear
     /// the selection. A pending gesture is untouched — its release still
     /// commits.
-    pub(crate) fn clear_selection_if_idle(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_selection_if_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let OpenState::Opened(opened) = &mut self.open
             && opened.selected_object.take().is_some()
         {
+            Self::reclaim_focus(self, window, cx);
             cx.notify();
         }
     }
@@ -423,30 +474,187 @@ impl MarkApp {
 
     /// Delete/Backspace: removes the selected overlay object — never page
     /// content (plan.md §13.2).
-    fn handle_delete_selected(&mut self, cx: &mut Context<Self>) {
+    fn handle_delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let OpenState::Opened(opened) = &mut self.open
             && let Some(id) = opened.selected_object.take()
             && opened.session.document().find_object(id).is_some()
         {
             opened.session.execute(Box::new(DeleteObject::new(id)));
+            Self::reclaim_focus(self, window, cx);
             cx.notify();
         }
     }
 
-    fn handle_undo(&mut self, cx: &mut Context<Self>) {
+    // ----- multi-object / multi-page workflow (plan.md §13.1, §13.2) ---------
+
+    /// The selected image object, cloned out of the document.
+    fn selected_image(&self) -> Option<(ObjectId, ImageObject)> {
+        let opened = match &self.open {
+            OpenState::Opened(opened) => opened,
+            _ => return None,
+        };
+        let id = opened.selected_object?;
+        #[allow(irrefutable_let_patterns)] // Text/Shape variants come later (plan.md §7)
+        let ObjectKind::Image(data) = opened.session.document().find_object(id)?.kind() else {
+            return None;
+        };
+        Some((id, data.clone()))
+    }
+
+    /// Ctrl+C: copies the selected object; pastes land on the current page
+    /// offset from the copy's own position (plan.md §13.2).
+    fn handle_copy(&mut self, _cx: &mut Context<Self>) {
+        if let Some((_, data)) = self.selected_image() {
+            self.clipboard = Some(data);
+            self.paste_count = 0;
+        }
+    }
+
+    /// Ctrl+V: pastes the clipboard onto the current page, one step further
+    /// out per consecutive paste, always fully on the page.
+    fn handle_paste(&mut self, cx: &mut Context<Self>) {
+        let Some(data) = self.clipboard.clone() else {
+            return;
+        };
+        if let OpenState::Opened(opened) = &mut self.open {
+            let page_index = opened.viewer.current_page() as usize;
+            let Some(page) = opened.session.document().pages().get(page_index) else {
+                return;
+            };
+            self.paste_count += 1;
+            let step = PASTE_STEP * self.paste_count as f32;
+            let mut pasted = data;
+            pasted.x += step;
+            pasted.y += step;
+            let page_size = Vec2::new(page.width(), page.height());
+            let clamped = crate::manipulation::clamped_into_page(
+                Rect {
+                    x: pasted.x,
+                    y: pasted.y,
+                    width: pasted.width,
+                    height: pasted.height,
+                },
+                page_size,
+            );
+            (pasted.x, pasted.y) = (clamped.x, clamped.y);
+            let object = DocumentObject::image(pasted);
+            let object_id = object.id();
+            opened
+                .session
+                .execute(Box::new(AddObject::new(page.id(), object)));
+            opened.selected_object = Some(object_id);
+            cx.notify();
+        }
+    }
+
+    /// Ctrl+D: duplicates the selected object on its own page, offset so it
+    /// lands beside the original, and selects the duplicate.
+    fn handle_duplicate(&mut self, cx: &mut Context<Self>) {
+        let Some((id, _)) = self.selected_image() else {
+            return;
+        };
+        if let OpenState::Opened(opened) = &mut self.open
+            && let Some(source) = opened.session.document().find_object(id).cloned()
+        {
+            let command =
+                DuplicateObject::new(id, source, Vec2::new(DUPLICATE_OFFSET, DUPLICATE_OFFSET));
+            let duplicate_id = command.duplicate.id();
+            opened.session.execute(Box::new(command));
+            opened.selected_object = Some(duplicate_id);
+            cx.notify();
+        }
+    }
+
+    /// "Duplicate to page…": places a copy of the selected object on
+    /// `page_index`, clamped fully onto that page; the source stays
+    /// selected on the current page (plan.md §13.1).
+    pub(crate) fn duplicate_to_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        let Some((_, mut data)) = self.selected_image() else {
+            return;
+        };
+        if let OpenState::Opened(opened) = &mut self.open {
+            let current = opened.viewer.current_page() as usize;
+            let Some(target) = opened.session.document().pages().get(page_index) else {
+                return;
+            };
+            // Same-page duplication is Ctrl+D's job.
+            if page_index == current {
+                return;
+            }
+            let page_size = Vec2::new(target.width(), target.height());
+            let clamped = crate::manipulation::clamped_into_page(
+                Rect {
+                    x: data.x,
+                    y: data.y,
+                    width: data.width,
+                    height: data.height,
+                },
+                page_size,
+            );
+            (data.x, data.y) = (clamped.x, clamped.y);
+            let object = DocumentObject::image(data);
+            opened
+                .session
+                .execute(Box::new(DuplicateToPage::new(object, target.id())));
+            cx.notify();
+        }
+    }
+
+    /// Toolbar size step: scales the selected object about its center,
+    /// aspect preserved, clamped to the page (plan.md §13).
+    fn handle_resize_selected(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let Some((id, data)) = self.selected_image() else {
+            return;
+        };
+        if let OpenState::Opened(opened) = &mut self.open {
+            let page_index = opened.viewer.current_page() as usize;
+            let Some(page) = opened.session.document().pages().get(page_index) else {
+                return;
+            };
+            let from = Rect {
+                x: data.x,
+                y: data.y,
+                width: data.width,
+                height: data.height,
+            };
+            let to = crate::manipulation::scaled_about_center(
+                from,
+                factor,
+                Vec2::new(page.width(), page.height()),
+            );
+            // A no-op step (already at page size) commits nothing.
+            if (to.width - from.width).abs() < 1e-3 && (to.height - from.height).abs() < 1e-3 {
+                return;
+            }
+            opened
+                .session
+                .execute(Box::new(ResizeObject::new(id, from, to)));
+            cx.notify();
+        }
+    }
+
+    fn handle_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let OpenState::Opened(opened) = &mut self.open
             && opened.session.undo()
         {
+            let had_selection = opened.selected_object.is_some();
             Self::validate_selection(opened);
+            if had_selection && opened.selected_object.is_none() {
+                Self::reclaim_focus(self, window, cx);
+            }
             cx.notify();
         }
     }
 
-    fn handle_redo(&mut self, cx: &mut Context<Self>) {
+    fn handle_redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let OpenState::Opened(opened) = &mut self.open
             && opened.session.redo()
         {
+            let had_selection = opened.selected_object.is_some();
             Self::validate_selection(opened);
+            if had_selection && opened.selected_object.is_none() {
+                Self::reclaim_focus(self, window, cx);
+            }
             cx.notify();
         }
     }
@@ -840,14 +1048,19 @@ impl Render for MarkApp {
             .on_action(cx.listener(|this, _: &ZoomInAction, _window, cx| this.handle_zoom_in(cx)))
             .on_action(cx.listener(|this, _: &ZoomOutAction, _window, cx| this.handle_zoom_out(cx)))
             .on_action(cx.listener(|this, _: &ZoomFitAction, _window, cx| this.handle_zoom_fit(cx)))
-            .on_action(cx.listener(|this, _: &ClearSelectionAction, _window, cx| {
-                this.handle_clear_selection(cx)
+            .on_action(cx.listener(|this, _: &ClearSelectionAction, window, cx| {
+                this.handle_clear_selection(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &DeleteSelectedAction, _window, cx| {
-                this.handle_delete_selected(cx)
+            .on_action(cx.listener(|this, _: &DeleteSelectedAction, window, cx| {
+                this.handle_delete_selected(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &UndoAction, _window, cx| this.handle_undo(cx)))
-            .on_action(cx.listener(|this, _: &RedoAction, _window, cx| this.handle_redo(cx)))
+            .on_action(cx.listener(|this, _: &CopyAction, _window, cx| this.handle_copy(cx)))
+            .on_action(cx.listener(|this, _: &PasteAction, _window, cx| this.handle_paste(cx)))
+            .on_action(
+                cx.listener(|this, _: &DuplicateAction, _window, cx| this.handle_duplicate(cx)),
+            )
+            .on_action(cx.listener(|this, _: &UndoAction, window, cx| this.handle_undo(window, cx)))
+            .on_action(cx.listener(|this, _: &RedoAction, window, cx| this.handle_redo(window, cx)))
             .flex()
             .flex_col()
             .size_full()
@@ -929,6 +1142,7 @@ fn workspace(
         })
         .unwrap_or_default();
 
+    let toolbar = selection_toolbar(theme, opened, library, cx);
     div()
         .id("mark-workspace")
         .flex()
@@ -937,9 +1151,167 @@ fn workspace(
         .items_stretch()
         .overflow_hidden()
         .child(thumbnails::sidebar(theme, &opened.viewer, window, cx))
-        .child(canvas::stage(theme, &weak, &mut opened.viewer, &placed, cx))
+        .child(canvas::stage(
+            theme,
+            &weak,
+            &mut opened.viewer,
+            &placed,
+            toolbar,
+            cx,
+        ))
         .child(assets::panel(theme, library, window, cx))
         .into_any_element()
+}
+
+/// The contextual toolbar for the selected object (plan.md §13): kind
+/// label, size steps, duplicate, "To page…", delete — one command per
+/// control. Rendered as a floating bar over the canvas; `None` whenever
+/// nothing is selected.
+fn selection_toolbar(
+    theme: &Theme,
+    opened: &OpenedDocument,
+    library: &assets::LibrarySnapshot,
+    cx: &mut Context<MarkApp>,
+) -> Option<AnyElement> {
+    let id = opened.selected_object?;
+    #[allow(irrefutable_let_patterns)] // Text/Shape variants come later (plan.md §7)
+    let ObjectKind::Image(data) = opened.session.document().find_object(id)?.kind() else {
+        return None;
+    };
+    let data = data.clone();
+    let current_page = opened.viewer.current_page() as usize;
+    let page_count = opened.session.document().page_count();
+    let kind_label = library
+        .assets
+        .iter()
+        .find(|asset| asset.id() == data.asset_id)
+        .map(|asset| asset.kind().label())
+        .unwrap_or("Image");
+
+    // "To page…" — one row per page, the current page disabled and checked
+    // (same-page duplication is Duplicate's job). Row order equals page
+    // order, so the menu index IS the page index.
+    let to_page = (page_count > 1).then(|| {
+        let weak = cx.weak_entity();
+        let items: Vec<MenuItem> = (0..page_count)
+            .map(|index| {
+                MenuItem::new(format!("Page {}", index + 1))
+                    .disabled(index == current_page)
+                    .checked(index == current_page)
+            })
+            .collect();
+        menu(
+            "mark-toolbar-to-page",
+            with_tooltip(
+                button(
+                    "mark-toolbar-to-page-trigger",
+                    "To page…",
+                    ButtonVariant::Secondary,
+                    cx,
+                ),
+                "Place a copy on another page",
+            ),
+            items,
+            move |index, _, cx| {
+                weak.update(cx, |app, cx| app.duplicate_to_page(index, cx))
+                    .ok();
+            },
+        )
+        .into_any_element()
+    });
+
+    let duplicate_hint = if cfg!(target_os = "macos") {
+        "Duplicate (⌘D)"
+    } else {
+        "Duplicate (Ctrl+D)"
+    };
+
+    Some(
+        div()
+            .id("mark-selection-toolbar")
+            .test_support()
+            .absolute()
+            .top(rems(0.75))
+            .right(rems(0.75))
+            .flex()
+            .items_center()
+            .gap(rems(0.25))
+            .px(rems(0.375))
+            .py(rems(0.25))
+            .border_1()
+            .border_color(theme.border)
+            .rounded_sm()
+            .bg(theme.background)
+            .shadow_md()
+            // Keep presses inside the toolbar: a bubbling press would hit
+            // the canvas viewport, clear the selection, and unmount the
+            // toolbar mid-press (same trap as the resize handles).
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                |_: &gpui_kit::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                },
+            )
+            .child(
+                div()
+                    .id("mark-toolbar-kind")
+                    .px(rems(0.25))
+                    .text_size(rems(0.75))
+                    .text_color(theme.secondary)
+                    .child(kind_label),
+            )
+            .child(with_tooltip(
+                icon_button(
+                    "mark-toolbar-smaller",
+                    IconName::Minus,
+                    "Smaller",
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.handle_resize_selected(0.9, cx)),
+                ),
+                "Smaller (−10%)",
+            ))
+            .child(with_tooltip(
+                icon_button(
+                    "mark-toolbar-bigger",
+                    IconName::Plus,
+                    "Bigger",
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.handle_resize_selected(1.1, cx)),
+                ),
+                "Bigger (+10%)",
+            ))
+            .child(with_tooltip(
+                button(
+                    "mark-toolbar-duplicate",
+                    "Duplicate",
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.handle_duplicate(cx))),
+                duplicate_hint,
+            ))
+            .children(to_page)
+            .child(with_tooltip(
+                icon_button(
+                    "mark-toolbar-delete",
+                    IconName::Trash,
+                    "Delete",
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.handle_delete_selected(window, cx)
+                })),
+                "Delete",
+            ))
+            .into_any_element(),
+    )
 }
 
 fn header(

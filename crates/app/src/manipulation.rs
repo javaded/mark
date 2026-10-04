@@ -150,6 +150,37 @@ impl Gesture {
     }
 }
 
+/// Rect shifted fully inside `page` when it extends past an edge: the
+/// position clamps so the object stays reachable, never pushed off-page.
+/// Oversized objects (larger than the page) anchor top-left.
+pub(crate) fn clamped_into_page(rect: Rect, page: Vec2) -> Rect {
+    let max_x = (page.x - rect.width).max(0.);
+    let max_y = (page.y - rect.height).max(0.);
+    Rect {
+        x: rect.x.clamp(0., max_x),
+        y: rect.y.clamp(0., max_y),
+        ..rect
+    }
+}
+
+/// Rect after uniform scaling about its center, edges clamped to
+/// [`MIN_OBJECT_SIZE`] and the page — the toolbar size steps (§13).
+pub(crate) fn scaled_about_center(rect: Rect, factor: f32, page: Vec2) -> Rect {
+    let width = (rect.width * factor)
+        .max(MIN_OBJECT_SIZE)
+        .min(page.x.max(MIN_OBJECT_SIZE));
+    let height = (rect.height * factor)
+        .max(MIN_OBJECT_SIZE)
+        .min(page.y.max(MIN_OBJECT_SIZE));
+    let grown = Rect {
+        x: rect.x - (width - rect.width) / 2.,
+        y: rect.y - (height - rect.height) / 2.,
+        width,
+        height,
+    };
+    clamped_into_page(grown, page)
+}
+
 /// Move preview: the original position translated by the screen-space
 /// pointer delta scaled into document units.
 pub(crate) fn moved_rect(from: Vec2, size: Vec2, delta: Vec2, zoom: f32) -> Rect {
@@ -403,5 +434,44 @@ mod tests {
         );
         r.update_pointer(Vec2::new(50., 0.), zoom(1.));
         assert!(r.commit().is_some());
+    }
+
+    #[test]
+    fn clamping_pulls_overshoot_back_inside_the_page() {
+        // 60×30 object at (250, 180) on a 300×200 page: x must pull back to
+        // 240, y to 170.
+        let r = clamped_into_page(rect(250., 180., 60., 30.), Vec2::new(300., 200.));
+        assert_eq!(r, rect(240., 170., 60., 30.));
+    }
+
+    #[test]
+    fn clamping_leaves_on_page_rects_and_anchors_oversized_top_left() {
+        let inside = clamped_into_page(rect(10., 20., 60., 30.), Vec2::new(300., 200.));
+        assert_eq!(inside, rect(10., 20., 60., 30.));
+        // A 400-wide object on a 300-wide page anchors at x = 0.
+        let oversized = clamped_into_page(rect(50., 0., 400., 30.), Vec2::new(300., 200.));
+        assert_eq!(oversized, rect(0., 0., 400., 30.));
+    }
+
+    #[test]
+    fn scaling_about_center_preserves_aspect_and_recenters() {
+        // 100×50 at (100, 100) grown 10%: 110×55 centered on the same
+        // midpoint (145, 125) → origin (95, 97.5).
+        let r = scaled_about_center(rect(100., 100., 100., 50.), 1.1, Vec2::new(400., 300.));
+        assert_eq!(r, rect(95., 97.5, 110., 55.));
+    }
+
+    #[test]
+    fn scaling_clamps_to_minimum_and_page_and_stays_inside() {
+        let page = Vec2::new(100., 100.);
+        // Shrink far past the minimum: edges clamp at 16 and the center
+        // stays put.
+        let shrunk = scaled_about_center(rect(40., 40., 80., 80.), 0.01, page);
+        assert_eq!(shrunk.width, MIN_OBJECT_SIZE);
+        assert_eq!(shrunk.height, MIN_OBJECT_SIZE);
+        assert_eq!((shrunk.x + shrunk.width / 2.), 80.);
+        // Grow past the page: clamps to the page and stays fully on it.
+        let grown = scaled_about_center(rect(10., 10., 80., 80.), 10., page);
+        assert_eq!(grown, rect(0., 0., 100., 100.));
     }
 }
