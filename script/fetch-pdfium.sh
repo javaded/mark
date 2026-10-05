@@ -48,7 +48,18 @@ TMP_ARCHIVE="$(mktemp -t pdfium-XXXXXX.tgz)"
 
 echo "Fetching PDFium ${TAG} for ${PLATFORM}..."
 echo "  ${URL}"
-curl -fSL --retry 3 -o "$TMP_ARCHIVE" "$URL"
+# --retry does not cover connect/SSL failures (curl exit 35/7), which
+# CI runners hit occasionally — so the whole download retries too.
+downloaded=0
+for attempt in 1 2 3 4 5; do
+  if curl -fSL --retry 3 --retry-connrefused -o "$TMP_ARCHIVE" "$URL"; then
+    downloaded=1
+    break
+  fi
+  echo "download attempt ${attempt} failed; retrying in 5s…" >&2
+  sleep 5
+done
+[ "$downloaded" = 1 ] || { echo "error: could not download ${URL}" >&2; exit 1; }
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
