@@ -41,9 +41,20 @@ fn vendor_platform_dir() -> String {
 }
 
 /// Subdirectories a fetched runtime's library may live in: bblanchon's
-/// archives use `lib/` on Linux/macOS but `bin/` for `pdfium.dll` on
-/// Windows.
+/// archives use `lib/` on Linux/macOS but keep `pdfium.dll` in `bin/` on
+/// Windows (`lib/` there holds only the import library `.lib`).
 const VENDOR_LIB_SUBDIRS: [&str; 2] = ["lib", "bin"];
+
+/// The library file name pdfium-render loads on this platform.
+fn platform_library_file() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpdfium.dylib"
+    } else {
+        "libpdfium.so"
+    }
+}
 
 /// First `vendor/pdfium/<platform>` library directory created by
 /// `script/fetch-pdfium.sh`.
@@ -57,13 +68,13 @@ pub fn vendor_lib_dir() -> Option<PathBuf> {
         PathBuf::from("vendor/pdfium"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium"),
     ];
-    let platform_dir = vendor_platform_dir();
+    let library = platform_library_file();
     let dir_with_library = |dir: &PathBuf| -> Option<PathBuf> {
         // The current platform's runtime first; any fetched runtime as a
         // fallback (a wrong-arch library simply fails to load, not
         // silently skip — better to try the exact match before anything
-        // else).
-        let names = std::iter::once(platform_dir.clone()).chain(
+        // else). A directory only counts when the library *file* is in it.
+        let names = std::iter::once(vendor_platform_dir()).chain(
             std::fs::read_dir(dir)
                 .ok()?
                 .flatten()
@@ -74,9 +85,9 @@ pub fn vendor_lib_dir() -> Option<PathBuf> {
                 VENDOR_LIB_SUBDIRS
                     .iter()
                     .map(|sub| dir.join(&name).join(sub))
-                    .find(|lib| lib.is_dir())
+                    .find(|lib| lib.join(library).is_file())
             })
-            .find(|lib| lib.is_dir())
+            .next()
     };
     candidates.iter().find_map(dir_with_library)
 }
