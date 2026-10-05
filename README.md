@@ -170,9 +170,6 @@ synthetic pointer and keyboard, asserting on the document model.
 `script/package.sh` builds the release artifacts and verifies the
 bundled runtime loads; tagging `v*` publishes them to a release.
 
-The development log — every phase, decision and verification — is
-`documentation.md`; the full specification is `plan.md`.
-
 ## License
 
 MIT

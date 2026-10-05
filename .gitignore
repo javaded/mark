@@ -14,3 +14,8 @@
 
 # Release artifacts built by script/package.sh
 /dist
+
+# Planning documents — kept locally, never published
+/plan.md
+/documentation.md
+/docs/
