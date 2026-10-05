@@ -3901,7 +3901,7 @@ dependencies = [
 
 [[package]]
 name = "mark-app"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "futures",
  "gpui-kit",
@@ -3920,14 +3920,14 @@ dependencies = [
 
 [[package]]
 name = "mark-core"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "uuid",
 ]
 
 [[package]]
 name = "mark-export"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "image",
  "mark-core",
@@ -3940,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "mark-image"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "image",
  "mark-core",
@@ -3949,7 +3949,7 @@ dependencies = [
 
 [[package]]
 name = "mark-pdf"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "futures-channel",
  "image",
@@ -5101,7 +5101,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "dirs 6.0.0",
  "rfd",
