@@ -2,6 +2,8 @@
 
 **Mark. Sign anything.**
 
+![Mark screenshot](screenshot.png)
+
 Open a PDF or an image, drop your signature or a stamp onto it, put it
 exactly where it belongs, repeat on the next page, export. The original
 file is never touched — the signed copy is a new file, written beside it.
