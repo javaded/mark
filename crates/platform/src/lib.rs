@@ -36,6 +36,44 @@ pub fn app_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// Reveals a file in the platform file manager: macOS selects it in Finder
+/// (`open -R`), Windows opens the folder with it selected
+/// (`explorer /select,`), Linux opens the containing folder (`xdg-open`).
+///
+/// Fire-and-forget: the process is spawned detached and the handle dropped.
+/// Errors (missing helper, headless session) are the caller's to log.
+pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let parent = path.parent().unwrap_or(path);
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(parent);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    let mut command = std::process::Command::new("true");
+    // The helper never gets our pipes: a file manager holding stdout open
+    // would keep parents (shells, test harnesses) waiting on EOF.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 /// Source of native open/save dialogs (plan.md §9.1).
 pub trait FilePicker {
     /// Asks the user to pick one existing document.

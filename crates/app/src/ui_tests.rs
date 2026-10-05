@@ -1063,4 +1063,17 @@ fn duplicate_to_page_and_export_announce_through_toasts(cx: &mut TestAppContext)
             .any(|m| m.starts_with("Exported ") && m.ends_with("page-signed.png")),
         "export toast: {messages:?}"
     );
+
+    // The export toast carries the reveal affordance (Phase 9's "open
+    // folder" Next point). The button is asserted, not clicked: the
+    // handler is a fire-and-forget platform spawn (opening a real file
+    // manager from `cargo test` would be worse than no click — the same
+    // reason the portal dialogs are never invoked headlessly).
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("mark-toast-action-1").is_some(),
+            "the export toast has a Show in folder action"
+        );
+    });
 }
