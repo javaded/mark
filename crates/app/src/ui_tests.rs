@@ -1106,3 +1106,107 @@ fn duplicate_to_page_and_export_announce_through_toasts(cx: &mut TestAppContext)
         );
     });
 }
+
+#[gpui_kit::test]
+fn library_asset_removal_confirms_then_deletes(cx: &mut TestAppContext) {
+    let fx = fixture(cx); // signature + stamp seeded, page open
+
+    // The stamp row carries a remove button; pressing it opens the
+    // confirmation, not the deletion.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(format!("mark-asset-remove-{}", fx.stamp_id), cx);
+    });
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-remove-cancel").is_some());
+        assert!(window.try_find("mark-remove-confirm").is_some());
+        window.click("mark-remove-cancel", cx);
+    });
+    // Cancel: the asset is still listed and still on disk.
+    let still_there = fx
+        .app
+        .update(cx, |app, _| app.library_asset(fx.stamp_id).is_some());
+    assert!(still_there, "cancel keeps the asset");
+
+    // Confirmed: manifest entry and stored PNG are gone; the signature
+    // survives; the row unmounts.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(format!("mark-asset-remove-{}", fx.stamp_id), cx);
+    });
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click("mark-remove-confirm", cx);
+    });
+    cx.run_until_parked();
+    let gone = fx.app.update(cx, |app, _| {
+        app.library_asset(fx.stamp_id).is_none() && app.library_asset(fx.asset_id).is_some()
+    });
+    assert!(gone, "stamp removed, signature kept");
+    let stored = fx
+        ._dir
+        .path()
+        .join("library")
+        .join(format!("assets/{}.png", fx.stamp_id));
+    assert!(!stored.exists(), "stored PNG deleted");
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .try_find(format!("mark-asset-{}", fx.stamp_id))
+                .is_none(),
+            "row unmounted after removal"
+        );
+    });
+
+    // The library persisted without the stamp.
+    let reopened = AssetLibrary::open(&fx._dir.path().join("library")).unwrap();
+    assert!(reopened.asset(fx.stamp_id).is_none());
+    assert!(reopened.asset(fx.asset_id).is_some());
+}
+
+#[gpui_kit::test]
+fn placed_asset_refuses_removal_until_unused(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+    let _ = place_signature(&fx, cx); // signature placed on the page
+
+    // Removing the placed asset is refused with a notice — never a silent
+    // future export failure.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(format!("mark-asset-remove-{}", fx.asset_id), cx);
+    });
+    let refused = fx
+        .app
+        .update(cx, |app, _| app.library_asset(fx.asset_id).is_some());
+    assert!(refused, "the placed asset stays in the library");
+    let messages = fx.app.update(cx, |app, _| app.toast_messages());
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.ends_with("is placed on this document")),
+        "refusal notice: {messages:?}"
+    );
+
+    // No confirmation is pending; removing the placement (undo) unblocks.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-remove-confirm").is_none());
+        window.press(&format!("{}-z", modifier()), cx);
+    });
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click(format!("mark-asset-remove-{}", fx.asset_id), cx);
+    });
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click("mark-remove-confirm", cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        fx.app
+            .update(cx, |app, _| app.library_asset(fx.asset_id).is_none()),
+        "after undoing the placement, removal proceeds"
+    );
+}

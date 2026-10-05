@@ -27,8 +27,8 @@ use gpui_omarchy::{
     with_tooltip,
 };
 use mark_core::{
-    AddObject, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession, DuplicateObject,
-    DuplicateToPage, ImageObject, ObjectId, ObjectKind, Rect, ResizeObject, Vec2,
+    AddObject, Asset, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession,
+    DuplicateObject, DuplicateToPage, ImageObject, ObjectId, ObjectKind, Rect, ResizeObject, Vec2,
 };
 use mark_export::export::{PngOverlay, compose_png_page, signed_destination};
 use mark_export::library::AssetLibrary;
@@ -207,6 +207,10 @@ pub struct MarkApp {
     /// Focus for the discard-changes dialog (focused while open, returns
     /// to the app scope on close).
     confirm_focus: FocusHandle,
+    /// The library asset whose removal waits on its confirmation dialog.
+    confirm_removal: Option<Asset>,
+    /// Focus for the asset-removal dialog.
+    confirm_removal_focus: FocusHandle,
     /// Recently opened documents (plan.md §18), persisted as JSON in the
     /// app config directory.
     recent: RecentDocuments,
@@ -273,6 +277,8 @@ impl MarkApp {
             confirm: None,
             resume_after_export: None,
             confirm_focus: cx.focus_handle(),
+            confirm_removal: None,
+            confirm_removal_focus: cx.focus_handle(),
             recent,
             recent_path,
             toasts: ToastManager::new(ToastMotion::sonner()),
@@ -581,6 +587,99 @@ impl MarkApp {
         .detach();
     }
 
+    /// Opens the removal confirmation for a library asset (library
+    /// management). An asset placed on the open document is refused with
+    /// a notice: removing it would leave a placement whose export fails.
+    pub(crate) fn request_remove_asset(
+        &mut self,
+        id: AssetId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.confirm.is_some() {
+            return;
+        }
+        let Some(asset) = self.library.asset(id).cloned() else {
+            return;
+        };
+        if self.asset_in_use(id) {
+            self.push_toast(
+                format!("{} is placed on this document", asset.name()),
+                ToastKind::Info,
+                cx,
+            );
+            return;
+        }
+        self.confirm_removal = Some(asset);
+        self.confirm_removal_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Whether any page of the open document carries a placement of `id`.
+    fn asset_in_use(&self, id: AssetId) -> bool {
+        match &self.open {
+            OpenState::Opened(opened) => opened
+                .session
+                .document()
+                .pages()
+                .iter()
+                .any(|page| {
+                    page.objects().iter().any(|object| {
+                        matches!(object.kind(), mark_core::ObjectKind::Image(data) if data.asset_id == id)
+                    })
+                }),
+            _ => false,
+        }
+    }
+
+    /// Cancel: the library stays exactly as it is.
+    fn cancel_removal_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.confirm_removal.take().is_some() {
+            Self::reclaim_focus(self, window, cx);
+            cx.notify();
+        }
+        true
+    }
+
+    /// Confirmed: drop the asset from the library off the UI thread and
+    /// adopt the reloaded manifest, cache entry dropped with it.
+    fn remove_asset_confirmed(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(asset) = self.confirm_removal.take() {
+            Self::reclaim_focus(self, window, cx);
+            let root = self.library.root().to_path_buf();
+            let id = asset.id();
+            let name: SharedString = asset.name().to_owned().into();
+            cx.spawn(async move |this, cx| {
+                let removed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        AssetLibrary::open(&root)
+                            .and_then(|mut library| library.remove(id).map(|_| library))
+                    })
+                    .await;
+                this.update(cx, |app, cx| {
+                    match removed {
+                        Ok(library) => {
+                            app.library = library;
+                            app.asset_images.remove(&id);
+                            tracing::info!("Removed library asset");
+                            app.push_toast(format!("Removed {name}"), ToastKind::Info, cx);
+                        }
+                        Err(_) => {
+                            tracing::warn!("the library asset could not be removed");
+                            app.push_toast("Could not remove the asset.", ToastKind::Info, cx);
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+        }
+        true
+    }
+
     /// Places `asset` centered on the current page at ~25% page width,
     /// selected and ready to drag (plan.md §12) — one undoable command.
     pub(crate) fn place_asset(&mut self, id: AssetId, cx: &mut Context<Self>) {
@@ -609,6 +708,10 @@ impl MarkApp {
     fn handle_clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.confirm.is_some() {
             self.cancel_confirm(window, cx);
+            return;
+        }
+        if self.confirm_removal.is_some() {
+            self.cancel_removal_confirm(window, cx);
             return;
         }
         let mut changed = false;
@@ -1651,6 +1754,12 @@ impl MarkApp {
         self.confirm.as_ref()
     }
 
+    /// Library membership lookup (test observation).
+    #[cfg(test)]
+    pub(crate) fn library_asset(&self, id: AssetId) -> Option<Asset> {
+        self.library.asset(id).cloned()
+    }
+
     /// The computed window title (test observation; the platform title is
     /// not readable back in headless tests).
     #[cfg(test)]
@@ -1927,6 +2036,11 @@ impl Render for MarkApp {
                     cx,
                 )
             }))
+            .children(
+                self.confirm_removal
+                    .as_ref()
+                    .map(|asset| removal_dialog(asset, &self.confirm_removal_focus, cx)),
+            )
             .children((!toasts.is_empty()).then(|| toast_area(&theme, &toasts, cx)))
     }
 }
@@ -1993,6 +2107,59 @@ fn discard_dialog(
                                 |this, _, window, cx| this.export_then_continue(window, cx),
                             )),
                         ),
+                ),
+        )
+}
+
+/// The asset-removal dialog (library management): Remove deletes the
+/// stored asset (manifest entry + normalized PNG — the user's original
+/// import file is untouched), Cancel keeps it. Escape cancels.
+fn removal_dialog(
+    asset: &Asset,
+    focus: &FocusHandle,
+    cx: &mut Context<MarkApp>,
+) -> impl IntoElement {
+    let remove = cx.weak_entity();
+    let cancel = cx.weak_entity();
+    gpui_omarchy::alert_dialog(focus, cx)
+        .open(true)
+        .on_ok(move |_, window, cx| {
+            remove
+                .update(cx, |app, cx| app.remove_asset_confirmed(window, cx))
+                .unwrap_or(true)
+        })
+        .on_cancel(move |_, window, cx| {
+            cancel
+                .update(cx, |app, cx| app.cancel_removal_confirm(window, cx))
+                .unwrap_or(true)
+        })
+        .popup(
+            dialog_popup(cx)
+                .child(dialog_title("Remove from library?", cx))
+                .child(dialog_description(
+                    format!(
+                        "“{}” is deleted from your stored assets. The image file you imported is untouched.",
+                        asset.name()
+                    ),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(rems(0.5))
+                        .child(AlertDialogCancel::new().child(dialog_button(
+                            "mark-remove-cancel",
+                            "Cancel",
+                            ButtonVariant::Outline,
+                            cx,
+                        )))
+                        .child(AlertDialogAction::new().child(dialog_button(
+                            "mark-remove-confirm",
+                            "Remove",
+                            ButtonVariant::Danger,
+                            cx,
+                        ))),
                 ),
         )
 }

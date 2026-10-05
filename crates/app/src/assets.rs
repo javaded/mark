@@ -160,6 +160,8 @@ fn section(
 }
 
 /// One asset row: aspect-correct preview plus name; click places the asset.
+/// The trailing remove button opens the removal confirmation — its press
+/// never reaches the row (that would place the asset being removed).
 fn row(
     theme: &Theme,
     asset: &Asset,
@@ -208,7 +210,25 @@ fn row(
             div()
                 .text_size(rems(0.75))
                 .text_color(theme.foreground)
+                .truncate()
                 .child(asset.name().to_owned()),
+        )
+        .child(div().flex_1())
+        .child(
+            icon_button(
+                format!("mark-asset-remove-{id}"),
+                IconName::Trash,
+                format!("Remove {}", asset.name()),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &gpui_kit::MouseDownEvent, _, cx| cx.stop_propagation()),
+            )
+            .on_click(cx.listener(move |app, _: &ClickEvent, window, cx| {
+                app.request_remove_asset(id, window, cx);
+            })),
         )
         .into_any_element()
 }

@@ -6,8 +6,10 @@
 //! cannot embed WebP, so every stored asset is RGBA PNG — the library is
 //! self-contained and the user may delete the original file).
 //!
-//! The original asset file is never modified; assets are only ever added
-//! here (removal arrives with library management UI).
+//! The original asset file is never modified. Assets are added by
+//! [`AssetLibrary::import`] and removed by [`AssetLibrary::remove`]
+//! (manifest entry plus stored PNG — the user's original import source
+//! is never touched).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,6 +112,23 @@ impl AssetLibrary {
         self.assets.push(asset.clone());
         self.save()?;
         Ok(asset)
+    }
+
+    /// Removes an asset from the library: the manifest loses its entry and
+    /// its normalized PNG is deleted from the stored assets.
+    ///
+    /// Returns the removed asset, or `None` when the id was unknown
+    /// (already removed — idempotent). The PNG deletion is best-effort:
+    /// once the manifest is saved the file is unreferenced, and a file
+    /// that is already gone is not an error.
+    pub fn remove(&mut self, id: AssetId) -> Result<Option<Asset>, LibraryError> {
+        let Some(index) = self.assets.iter().position(|asset| asset.id() == id) else {
+            return Ok(None);
+        };
+        let asset = self.assets.remove(index);
+        self.save()?;
+        let _ = fs::remove_file(self.root.join(asset.image_path()));
+        Ok(Some(asset))
     }
 
     /// Decodes an asset's normalized PNG for rendering.
@@ -337,5 +356,45 @@ mod tests {
         );
         assert!(library.assets().is_empty());
         assert!(!dir.path().join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn remove_drops_the_manifest_entry_and_the_stored_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = AssetLibrary::open(dir.path()).unwrap();
+        let kept = library
+            .import(&source_image("kept"), AssetKind::Signature)
+            .unwrap();
+        let removed = library
+            .import(&source_image("gone"), AssetKind::Stamp)
+            .unwrap();
+
+        let removed = library.remove(removed.id()).unwrap().expect("removed");
+        assert_eq!(removed.kind(), AssetKind::Stamp);
+        assert!(!dir.path().join(removed.image_path()).exists());
+
+        // The survivor is intact, on disk and in the manifest.
+        let reopened = AssetLibrary::open(dir.path()).unwrap();
+        assert_eq!(reopened.assets().len(), 1);
+        assert!(reopened.asset(kept.id()).is_some());
+        assert!(dir.path().join(kept.image_path()).exists());
+        assert!(reopened.load_image(kept.id()).is_ok());
+    }
+
+    #[test]
+    fn remove_unknown_id_is_none_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = AssetLibrary::open(dir.path()).unwrap();
+        let asset = library
+            .import(&source_image("idem"), AssetKind::Signature)
+            .unwrap();
+        let before = fs::read(dir.path().join(MANIFEST_FILE)).unwrap();
+
+        assert!(library.remove(AssetId::new()).unwrap().is_none());
+        assert!(library.remove(AssetId::new()).unwrap().is_none());
+
+        // Nothing changed: same manifest bytes, same assets, same file.
+        assert_eq!(fs::read(dir.path().join(MANIFEST_FILE)).unwrap(), before);
+        assert!(library.asset(asset.id()).is_some());
     }
 }
