@@ -29,7 +29,7 @@ detect_platform() {
     Linux)
       # musl-based distros need the musl build
       if ldd --version 2>&1 | grep -qi musl; then
-        echo "linux-musl-${arch#x64}"
+        echo "linux-musl-${arch}"
       else
         echo "linux-${arch}"
       fi

@@ -29,8 +29,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Real PDFium runtime: mark-pdf integration tests bind to it; tests
-      # skip gracefully where it is absent (macos/windows domain jobs).
+      # Real PDFium runtime: mark-pdf integration tests bind to it on
+      # every platform (tests still skip gracefully where it is absent).
       - name: Fetch PDFium runtime
         run: ./script/fetch-pdfium.sh
 
@@ -39,8 +39,12 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --all-targets
 
-  domain:
-    name: ${{ matrix.os }} (domain crates check + test)
+  # Phase 11 (plan.md §19.2, §20.5): the full workspace — including the
+  # UI and platform crates — compiles and tests on every platform, with
+  # the real PDFium runtime fetched per OS so mark-pdf integration tests
+  # bind it everywhere instead of skipping.
+  cross-platform:
+    name: ${{ matrix.os }} (full workspace check + test, PDFium bound)
     strategy:
       fail-fast: false
       matrix:
@@ -53,8 +57,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Domain crates must build everywhere; UI/platform crates may lag
-      # (plan.md §20.5). PDFium binding is runtime-only, so mark-pdf
-      # compiles without the binary; unit tests never load it.
-      - run: cargo check --workspace --exclude mark-app --exclude platform --all-targets
-      - run: cargo test --workspace --exclude mark-app --exclude platform --all-targets
+      # bash + curl + tar exist on all three runner images (Git bash on
+      # Windows); the script detects the platform and fetches the matching
+      # runtime (dylib on macOS, dll on Windows).
+      - name: Fetch PDFium runtime
+        shell: bash
+        run: ./script/fetch-pdfium.sh
+
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --all-targets

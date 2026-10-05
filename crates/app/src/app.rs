@@ -91,11 +91,21 @@ pub(crate) enum PendingAction {
 }
 
 /// One transient toast notice (plan.md §10, §17): asynchronous status that
-/// requires no decision.
+/// requires no decision. An optional action renders as an inline button
+/// (the export toast's "Show in folder").
 #[derive(Clone, Debug)]
 struct ToastNotice {
     message: SharedString,
     kind: ToastKind,
+    action: Option<ToastAction>,
+}
+
+/// An inline affordance on a toast.
+#[derive(Clone, Debug)]
+struct ToastAction {
+    label: SharedString,
+    /// Reveal this path in the platform file manager.
+    reveal: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1489,7 +1499,15 @@ impl MarkApp {
                 }
                 let name: SharedString = file_name(&destination).into();
                 tracing::info!(destination = %name, "Export completed");
-                self.push_toast(format!("Exported {name}"), ToastKind::Success, cx);
+                self.push_toast_with_action(
+                    format!("Exported {name}"),
+                    ToastKind::Success,
+                    Some(ToastAction {
+                        label: "Show in folder".into(),
+                        reveal: destination.clone(),
+                    }),
+                    cx,
+                );
                 self.export = Some(ExportStatus::Done { name });
                 if let Some(pending) = self.resume_after_export.take() {
                     self.perform_pending(pending, cx);
@@ -1518,6 +1536,17 @@ impl MarkApp {
         kind: ToastKind,
         cx: &mut Context<Self>,
     ) {
+        self.push_toast_with_action(message, kind, None, cx);
+    }
+
+    /// [`Self::push_toast`] with an inline action button.
+    fn push_toast_with_action(
+        &mut self,
+        message: impl Into<SharedString>,
+        kind: ToastKind,
+        action: Option<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
         self.toasts.push(
@@ -1525,6 +1554,7 @@ impl MarkApp {
             ToastNotice {
                 message: message.into(),
                 kind,
+                action,
             },
             ToastOptions {
                 timeout: Some(TOAST_TIMEOUT),
@@ -1996,9 +2026,41 @@ fn toast_area(
                             .size(rems(1.))
                             .text_color(notice.kind.color(theme)),
                     )
-                    .child(div().child(notice.message.clone())),
+                    .child(div().child(notice.message.clone()))
+                    .children(notice.action.as_ref().map(|action| {
+                        let reveal = action.reveal.clone();
+                        div()
+                            .id(format!("mark-toast-action-{id}"))
+                            .test_support()
+                            .ml_auto()
+                            .text_size(rems(0.75))
+                            .text_color(theme.accent)
+                            .rounded_sm()
+                            .px(rems(0.25))
+                            .hover(|style| style.underline().bg(theme.background))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                                    reveal_path(reveal.clone(), cx);
+                                }),
+                            )
+                            .child(action.label.clone())
+                    })),
             )
         }))
+}
+
+/// Reveals a path in the platform file manager; failures log and vanish
+/// (a missing helper is never worth interrupting the user for).
+fn reveal_path(path: PathBuf, cx: &mut Context<MarkApp>) {
+    tracing::info!(path = %path.display(), "revealing in file manager");
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(error) = platform::reveal_in_file_manager(&path) {
+                tracing::warn!(%error, "could not reveal in file manager");
+            }
+        })
+        .detach();
 }
 
 /// The document workspace: thumbnail sidebar, canvas stage with placed

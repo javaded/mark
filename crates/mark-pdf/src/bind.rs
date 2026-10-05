@@ -14,6 +14,32 @@ use std::sync::OnceLock;
 
 use pdfium_render::prelude::Pdfium;
 
+/// The `vendor/pdfium/<platform>` directory name the fetch script uses
+/// for the *current* platform, so a machine with several runtimes fetched
+/// (cross-platform dev checkout) binds the right one.
+fn vendor_platform_dir() -> String {
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "unknown"
+    };
+    if cfg!(target_os = "linux") {
+        if cfg!(target_env = "musl") {
+            format!("linux-musl-{arch}")
+        } else {
+            format!("linux-{arch}")
+        }
+    } else if cfg!(target_os = "macos") {
+        format!("mac-{arch}")
+    } else if cfg!(target_os = "windows") {
+        format!("win-{arch}")
+    } else {
+        format!("unknown-{arch}")
+    }
+}
+
 /// First `vendor/pdfium/<platform>/lib` directory created by
 /// `script/fetch-pdfium.sh`.
 ///
@@ -26,13 +52,22 @@ pub fn vendor_lib_dir() -> Option<PathBuf> {
         PathBuf::from("vendor/pdfium"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium"),
     ];
-    let platform_lib = |dir: &PathBuf| {
-        std::fs::read_dir(dir).ok()?.flatten().find_map(|platform| {
-            let lib = platform.path().join("lib");
-            lib.is_dir().then_some(lib)
-        })
-    };
-    candidates.iter().find_map(platform_lib)
+    // The current platform's runtime first; any fetched runtime as a
+    // fallback (a wrong-arch library simply fails to load, not silently
+    // skip — better to try the exact match before anything else).
+    let platform_dir = vendor_platform_dir();
+    candidates.iter().find_map(|dir| {
+        dir.join(&platform_dir)
+            .join("lib")
+            .is_dir()
+            .then(|| dir.join(&platform_dir).join("lib"))
+            .or_else(|| {
+                std::fs::read_dir(dir).ok()?.flatten().find_map(|platform| {
+                    let lib = platform.path().join("lib");
+                    lib.is_dir().then_some(lib)
+                })
+            })
+    })
 }
 
 /// The process-wide PDFium instance: the first caller loads the vendored
