@@ -27,4 +27,4 @@ Verify the bundled PDFium runtime from a terminal:
 Keyboard: Ctrl/Cmd-O open · Ctrl/Cmd-S export · Ctrl/Cmd-Z undo ·
 Ctrl/Cmd-D duplicate · Delete removes · Esc deselects.
 
-Project: https://github.com/javaded/mark (Apache-2.0).
+Project: https://github.com/javaded/mark (MIT).
