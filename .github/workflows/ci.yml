@@ -64,5 +64,13 @@ jobs:
         shell: bash
         run: ./script/fetch-pdfium.sh
 
+      # Proof the runtime actually bound: a green test suite alone can't
+      # show it (tests skip gracefully without a runtime — that path is
+      # exactly what this step rules out on Windows, whose archive keeps
+      # pdfium.dll under bin/, not lib/).
+      - name: Verify PDFium binding
+        shell: bash
+        run: cargo run -p mark-pdf --example check_bind
+
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --all-targets

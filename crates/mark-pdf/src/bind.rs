@@ -40,7 +40,12 @@ fn vendor_platform_dir() -> String {
     }
 }
 
-/// First `vendor/pdfium/<platform>/lib` directory created by
+/// Subdirectories a fetched runtime's library may live in: bblanchon's
+/// archives use `lib/` on Linux/macOS but `bin/` for `pdfium.dll` on
+/// Windows.
+const VENDOR_LIB_SUBDIRS: [&str; 2] = ["lib", "bin"];
+
+/// First `vendor/pdfium/<platform>` library directory created by
 /// `script/fetch-pdfium.sh`.
 ///
 /// Resolved from the working directory (app and examples run from the
@@ -52,22 +57,28 @@ pub fn vendor_lib_dir() -> Option<PathBuf> {
         PathBuf::from("vendor/pdfium"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium"),
     ];
-    // The current platform's runtime first; any fetched runtime as a
-    // fallback (a wrong-arch library simply fails to load, not silently
-    // skip — better to try the exact match before anything else).
     let platform_dir = vendor_platform_dir();
-    candidates.iter().find_map(|dir| {
-        dir.join(&platform_dir)
-            .join("lib")
-            .is_dir()
-            .then(|| dir.join(&platform_dir).join("lib"))
-            .or_else(|| {
-                std::fs::read_dir(dir).ok()?.flatten().find_map(|platform| {
-                    let lib = platform.path().join("lib");
-                    lib.is_dir().then_some(lib)
-                })
+    let dir_with_library = |dir: &PathBuf| -> Option<PathBuf> {
+        // The current platform's runtime first; any fetched runtime as a
+        // fallback (a wrong-arch library simply fails to load, not
+        // silently skip — better to try the exact match before anything
+        // else).
+        let names = std::iter::once(platform_dir.clone()).chain(
+            std::fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .filter_map(|platform| platform.file_name().into_string().ok()),
+        );
+        names
+            .filter_map(|name| {
+                VENDOR_LIB_SUBDIRS
+                    .iter()
+                    .map(|sub| dir.join(&name).join(sub))
+                    .find(|lib| lib.is_dir())
             })
-    })
+            .find(|lib| lib.is_dir())
+    };
+    candidates.iter().find_map(dir_with_library)
 }
 
 /// The process-wide PDFium instance: the first caller loads the vendored
