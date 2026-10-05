@@ -41,18 +41,28 @@ gpui_kit::actions!(
 );
 
 fn main() {
+    // Structured logging (plan.md §17): never document contents or
+    // signature pixels — counts, durations, and outcomes only.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .init();
+
     // Optional file argument: `mark picture.png` opens it directly, no dialog.
     let open_path = std::env::args().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        // The full Lucide catalog, not the curated default subset: Mark
+        // uses icons (signature, stamp, zoom, chevrons, file-x) outside
+        // gpui-kit's own component set — with the subset they silently
+        // render as nothing.
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             // Initializes gpui-base, Omarchy components, and the system theme
             // (Omarchy theme on Linux; Tokyo Night fallback elsewhere).
             gpui_omarchy::init(cx);
 
             init_keybindings(cx);
-            cx.on_action(|_: &Quit, cx| cx.quit());
 
             // open_window mounts the base Root, which later renders
             // dialogs, sheets, and notifications above the app view.
@@ -71,6 +81,15 @@ fn main() {
                     // Actions dispatch through the focused node: give the
                     // app keyboard focus from the first frame.
                     window.focus(&app.read(cx).focus_handle().clone(), cx);
+                    // Closing the window goes through the same dirty-state
+                    // decision as quitting (plan.md §16); the app refuses
+                    // while a document has unexported changes.
+                    let close_app = app.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        close_app
+                            .update(cx, |app, cx| app.request_close(window, cx))
+                            .unwrap_or(true)
+                    });
                     app
                 },
             )
