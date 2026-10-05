@@ -45,11 +45,13 @@ detect_platform() {
 }
 
 PLATFORM="$(detect_platform)"
-LIB_NAME="$(case "$PLATFORM" in
-  win-*) echo "pdfium.dll" ;;
-  mac-*) echo "libpdfium.dylib" ;;
-  *) echo "libpdfium.so" ;;
-esac)"
+# Plain case-assignments, no $(case …) substitutions: macOS's /bin/bash
+# (3.2) fails to parse those inside command substitution.
+case "$PLATFORM" in
+  win-*) LIB_NAME="pdfium.dll" ;;
+  mac-*) LIB_NAME="libpdfium.dylib" ;;
+  *) LIB_NAME="libpdfium.so" ;;
+esac
 
 VENDOR_LIB="$(find "vendor/pdfium/$PLATFORM" -name "$LIB_NAME" -print | head -1)"
 if [ -z "$VENDOR_LIB" ]; then
@@ -104,11 +106,11 @@ case "$PLATFORM" in
     ;;
 esac
 
-BINARY="$(case "$PLATFORM" in
-  mac-*) echo "$STAGE/Mark.app/Contents/MacOS/mark" ;;
-  win-*) echo "$STAGE/mark/mark.exe" ;;
-  *) echo "$STAGE/mark/mark" ;;
-esac)"
+case "$PLATFORM" in
+  mac-*) BINARY="$STAGE/Mark.app/Contents/MacOS/mark" ;;
+  win-*) BINARY="$STAGE/mark/mark.exe" ;;
+  *) BINARY="$STAGE/mark/mark" ;;
+esac
 
 # §19.3: PDFium bundling is explicitly tested during packaging. Hide the
 # development vendor tree so a successful check proves the bundled library
