@@ -1,24 +1,36 @@
+<div align="center">
+
 # Mark
 
-**Mark. Sign anything.**
+**Sign anything.**
 
 ![Mark screenshot](screenshot.png)
 
-Open a PDF or an image, drop your signature or a stamp onto it, put it
-exactly where it belongs, repeat on the next page, export. The original
-file is never touched — the signed copy is a new file, written beside it.
+Open a PDF or image.<br>
+Drop a signature or stamp onto it.<br>
+Put it where it belongs.<br>
+Export.
 
-Native Rust, no Electron, no network, no account. Built with GPUI, so it
-follows your desktop's theme and behaves like the rest of your apps: on
-Omarchy it is an Omarchy app, on macOS a Mac app, on Windows a Windows
-app.
+Native Rust + GPUI.<br>
+Local only. No account. No uploads.
+
+[![Download](https://img.shields.io/badge/Download-latest_release-2ea44f)](https://github.com/javeded/mark/releases/latest)
+[![GitHub](https://img.shields.io/badge/GitHub-javaded%2Fmark-181717?logo=github&logoColor=white)](https://github.com/javeded/mark)
+
+</div>
+
+---
 
 ## Install
 
 Download the artifact for your machine from the
-[latest release](https://github.com/javaded/mark/releases), unpack it, and
+[latest release](https://github.com/javeded/mark/releases), unpack it, and
 run it. The PDFium runtime ships inside the package, next to the
 executable — no setup step.
+
+Mark is built with GPUI, so it follows your desktop's theme and behaves
+like the rest of your apps: on Omarchy it is an Omarchy app, on macOS a
+Mac app, on Windows a Windows app.
 
 **Linux** — unpack `mark-*-linux-x64.tar.gz` and either run `mark/mark`
 where it is, or install it:
