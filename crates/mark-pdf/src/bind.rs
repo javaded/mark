@@ -1,7 +1,8 @@
 //! Runtime binding to the PDFium library (plan.md §6.3).
 //!
-//! Binding order mirrors `Pdfium::default()` semantics: the vendored
-//! library from `script/fetch-pdfium.sh` first, then the system library.
+//! Binding order: the library **bundled next to the executable** (the
+//! packaged layout, §6.3's first choice), then the development vendor
+//! directory from `script/fetch-pdfium.sh`, then the system library.
 //!
 //! pdfium-render keeps the loaded library in a process-global cell: only
 //! the *first* bind can load it, and any `Pdfium` value shares that global
@@ -56,14 +57,44 @@ fn platform_library_file() -> &'static str {
     }
 }
 
-/// First `vendor/pdfium/<platform>` library directory created by
+/// The library directory for the packaged layout (§6.3 binding order):
+/// the runtime shipped next to the executable.
+///
+/// `script/package.sh` installs the library flat next to the binary
+/// (Windows zip, Linux tarball) or into the platform's conventional
+/// bundle location (macOS `.app` Frameworks, Unix prefix `lib/`). Every
+/// layout resolves by absolute path, so no rpath / `DYLD_LIBRARY_PATH` /
+/// `PATH` mutation is ever needed.
+fn bundled_lib_dir() -> Option<PathBuf> {
+    let library = platform_library_file();
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?.to_path_buf();
+    let bundle_parent = exe_dir.parent().map(|parent| parent.to_path_buf());
+    // Flat next to the binary, `<prefix>/bin`+`<prefix>/lib`, and the
+    // macOS .app `Contents/MacOS` + `Contents/Frameworks` split.
+    let candidates: [Option<PathBuf>; 4] = [
+        Some(exe_dir.clone()),
+        Some(exe_dir.join("lib")),
+        bundle_parent.as_ref().map(|parent| parent.join("lib")),
+        bundle_parent
+            .as_ref()
+            .map(|parent| parent.join("Frameworks")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.join(library).is_file())
+}
+
+/// The library directory for the development checkout: the current
+/// platform's `vendor/pdfium/<platform>` tree created by
 /// `script/fetch-pdfium.sh`.
 ///
 /// Resolved from the working directory (app and examples run from the
 /// workspace root) *and* from this crate's manifest path (test binaries
 /// run from `crates/mark-pdf`, where the relative lookup alone would miss
 /// the fetched runtime and silently skip every integration test).
-pub fn vendor_lib_dir() -> Option<PathBuf> {
+fn dev_vendor_lib_dir() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("vendor/pdfium"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium"),
@@ -90,6 +121,14 @@ pub fn vendor_lib_dir() -> Option<PathBuf> {
             .next()
     };
     candidates.iter().find_map(dir_with_library)
+}
+
+/// The directory the PDFium runtime loads from, in §6.3's binding order:
+/// bundled next to the executable, then the development vendor tree.
+/// `None` when neither is present (the system-library fallback in
+/// [`try_bind`] takes over).
+pub fn vendor_lib_dir() -> Option<PathBuf> {
+    bundled_lib_dir().or_else(dev_vendor_lib_dir)
 }
 
 /// The process-wide PDFium instance: the first caller loads the vendored

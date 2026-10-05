@@ -11,3 +11,6 @@
 /agent/
 /.claude/
 
+
+# Release artifacts built by script/package.sh
+/dist

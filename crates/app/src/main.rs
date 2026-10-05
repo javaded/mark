@@ -49,7 +49,17 @@ fn main() {
         .init();
 
     // Optional file argument: `mark picture.png` opens it directly, no dialog.
-    let open_path = std::env::args().nth(1).map(PathBuf::from);
+    // `mark --check-pdfium` is the headless packaging diagnostic (§6.3):
+    // it verifies the bundled runtime loads and exits — no window, no
+    // display server, usable from CI and user bug reports alike.
+    let mut open_path = None;
+    for arg in std::env::args().skip(1) {
+        if arg == "--check-pdfium" {
+            check_pdfium();
+        } else if open_path.is_none() {
+            open_path = Some(PathBuf::from(arg));
+        }
+    }
 
     gpui_kit::application()
         // The full Lucide catalog, not the curated default subset: Mark
@@ -135,6 +145,34 @@ fn init_keybindings(cx: &mut gpui_kit::App) {
         KeyBinding::new(&format!("{modifier}-shift-z"), Redo, None),
         KeyBinding::new(&format!("{modifier}-y"), Redo, None),
     ]);
+}
+
+/// Binds the PDFium runtime and reports where it loaded from, exiting
+/// non-zero when it didn't (§6.3 packaging diagnostic).
+fn check_pdfium() -> ! {
+    let location = mark_pdf::bind::vendor_lib_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| "system library paths".to_owned());
+    match mark_pdf::bind::try_bind() {
+        Some(pdfium) => {
+            // A real FPDF call, not just a successful dlopen.
+            let pages = pdfium
+                .create_new_pdf()
+                .expect("PDFium bound but FPDF_CreateNewDocument failed")
+                .pages()
+                .len();
+            println!("PDFium OK (loaded from {location}; created empty document, {pages} pages).");
+            std::process::exit(0);
+        }
+        None => {
+            eprintln!("PDFium NOT available (looked in {location}).");
+            eprintln!(
+                "Packaged builds ship the runtime next to the executable; \
+                 developers run script/fetch-pdfium.sh."
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 fn window_options(title: SharedString, cx: &mut gpui_kit::App) -> WindowOptions {

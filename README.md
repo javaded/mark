@@ -66,6 +66,24 @@ Verify the PDFium binding:
 cargo run -p mark-pdf --example check_bind
 ```
 
+## Packaging (release builds)
+
+`script/package.sh` builds the release binary and assembles the per-OS
+artifact with the PDFium runtime bundled next to the executable (plan.md
+§6.3/§19.3), then verifies the packaged binary loads its bundled runtime:
+
+```bash
+script/fetch-pdfium.sh   # first, once per platform
+script/package.sh        # → dist/mark-<version>-<platform>.tar.gz|.zip
+```
+
+Layouts: Linux tarball (`mark`, `libpdfium.so`, `.desktop` entry + icon),
+macOS `Mark.app` zip (runtime in `Contents/Frameworks`), Windows zip
+(`mark.exe`, `pdfium.dll`). The app resolves the runtime by absolute path
+— no rpath or environment setup. `mark --check-pdfium` is the headless
+diagnostic. Tagging `v*` triggers the release workflow, which builds all
+three platforms and attaches the artifacts to a GitHub release.
+
 ## License
 
 Apache-2.0

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mark
+GenericName=Document Signer
+Comment=Sign anything. Place signatures and stamps on PDFs and images.
+Exec=mark %f
+Icon=mark
+Categories=Office;Graphics;
+MimeType=application/pdf;image/png;image/jpeg;image/webp;
+Terminal=false
+NoDisplay=false
