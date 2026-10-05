@@ -897,7 +897,8 @@ fn recent_documents_persist_list_and_reopen(cx: &mut TestAppContext) {
             .path()
             .to_path_buf()
     });
-    assert_eq!(source, fx.page_path);
+    // The reopened document's source is the recorded (canonicalized) path.
+    assert_eq!(source, platform::canonicalize(&fx.page_path));
 
     // Gone from disk → gone from the list (convenience data only).
     let missing = second._dir.path().join("gone.pdf");
