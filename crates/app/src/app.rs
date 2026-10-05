@@ -500,7 +500,7 @@ impl MarkApp {
     /// Paths are canonicalized so a relative CLI argument still opens from
     /// whatever directory the next launch uses.
     fn record_recent(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canonical = platform::canonicalize(path);
         self.recent.record(&canonical);
         let Some(file) = self.recent_path.clone() else {
             return;

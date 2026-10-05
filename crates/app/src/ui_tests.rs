@@ -208,6 +208,32 @@ fn with_window<R>(
         .expect("update test window")
 }
 
+/// The primary modifier tests press: the same choice `init_keybindings`
+/// makes, so synthetic keys exercise the bindings a real user hits
+/// (Cmd on macOS, Ctrl elsewhere — plan.md §15, §19.2).
+fn modifier() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    }
+}
+
+/// Pumps in small steps until a document is open — `run_until_parked`
+/// alone cannot await the PDF worker's foreign-thread wake (the Phase 9
+/// scheduler lesson; without this, the frame can still show "Opening").
+fn wait_until_opened(fx: &Fixture, cx: &mut TestAppContext) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        cx.run_until_parked();
+        let opened = fx.app.update(cx, |app, _| app.opened_document().is_some());
+        if opened || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 // ----- tests ------------------------------------------------------------------
 
 #[gpui_kit::test]
@@ -286,14 +312,14 @@ fn drag_moves_object_and_undo_redo_round_trip(cx: &mut TestAppContext) {
 
     // Ctrl+Z: back to the placement position exactly.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     let (_, undone) = sole_object(&fx, cx);
     assert_eq!(undone, before);
 
     // Ctrl+Shift+Z: the move returns.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-shift-z", cx);
+        window.press(&format!("{}-shift-z", modifier()), cx);
     });
     let (_, redone) = sole_object(&fx, cx);
     assert_eq!(redone, after);
@@ -336,7 +362,7 @@ fn handle_drag_resizes_aspect_locked_and_undo_restores(cx: &mut TestAppContext) 
 
     // Ctrl+Z restores the exact prior geometry.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     let (_, undone) = sole_object(&fx, cx);
     assert_eq!(undone, before);
@@ -361,7 +387,7 @@ fn delete_removes_object_and_undo_restores_it(cx: &mut TestAppContext) {
 
     // Ctrl+Z brings it back with its geometry.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     let (restored_id, restored) = sole_object(&fx, cx);
     assert_eq!(restored_id, id);
@@ -369,7 +395,7 @@ fn delete_removes_object_and_undo_restores_it(cx: &mut TestAppContext) {
 
     // Redo deletes again.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-shift-z", cx);
+        window.press(&format!("{}-shift-z", modifier()), cx);
     });
     assert_eq!(object_count(&fx, cx), 0);
 }
@@ -382,7 +408,7 @@ fn ctrl_d_duplicates_offset_and_selects_the_copy(cx: &mut TestAppContext) {
     let (id, before) = place_signature(&fx, cx);
 
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-d", cx);
+        window.press(&format!("{}-d", modifier()), cx);
     });
 
     let objects = page_objects(&fx, cx, 0);
@@ -401,7 +427,7 @@ fn ctrl_d_duplicates_offset_and_selects_the_copy(cx: &mut TestAppContext) {
 
     // Undo removes the copy only.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     let objects = page_objects(&fx, cx, 0);
     assert_eq!(objects.len(), 1);
@@ -415,13 +441,13 @@ fn copy_paste_cascades_offset_and_undo_removes_pastes(cx: &mut TestAppContext) {
 
     // Copy alone changes nothing.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-c", cx);
+        window.press(&format!("{}-c", modifier()), cx);
     });
     assert_eq!(object_count(&fx, cx), 1);
 
     // First paste: one step offset from the copied position, selected.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-v", cx);
+        window.press(&format!("{}-v", modifier()), cx);
     });
     let objects = page_objects(&fx, cx, 0);
     assert_eq!(objects.len(), 2);
@@ -433,7 +459,7 @@ fn copy_paste_cascades_offset_and_undo_removes_pastes(cx: &mut TestAppContext) {
     // Second paste cascades one step further (plan.md §13.2: never exactly
     // on top).
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-v", cx);
+        window.press(&format!("{}-v", modifier()), cx);
     });
     let objects = page_objects(&fx, cx, 0);
     assert_eq!(objects.len(), 3);
@@ -442,8 +468,8 @@ fn copy_paste_cascades_offset_and_undo_removes_pastes(cx: &mut TestAppContext) {
 
     // Undo twice: back to just the placed original.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     let objects = page_objects(&fx, cx, 0);
     assert_eq!(objects.len(), 1);
@@ -486,8 +512,8 @@ fn toolbar_size_steps_commit_one_resize_each(cx: &mut TestAppContext) {
 
     // Undo both steps back to the placed geometry.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     let (_, undone) = sole_object(&fx, cx);
     assert_eq!(undone, before);
@@ -590,7 +616,7 @@ fn duplicate_to_page_menu_copies_to_the_chosen_page(cx: &mut TestAppContext) {
 
     // Undo removes only the copy.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     assert_eq!(page_objects(&fx, cx, 0).len(), 1);
     assert_eq!(page_objects(&fx, cx, 1).len(), 0);
@@ -716,7 +742,7 @@ fn export_pdf_document_places_real_image_objects(cx: &mut TestAppContext) {
     let fx = seeded(cx);
     let path = pdf_fixture("letter-portrait.pdf");
     fx.app.update(cx, |app, cx| app.open_path(path, cx));
-    cx.run_until_parked();
+    wait_until_opened(&fx, cx);
 
     // Sign page 1 with the stamp through the real placement path.
     with_window(&fx, cx, |window, cx| {
@@ -846,11 +872,13 @@ fn recent_documents_persist_list_and_reopen(cx: &mut TestAppContext) {
     let fx = fixture(cx); // opens page.png through the production path
     cx.run_until_parked();
 
-    // The list persisted (plan.md §18), most recent first.
+    // The list persisted (plan.md §18), most recent first — canonicalized,
+    // so symlinked tempdirs (macOS `/private/var`) and 8.3 short names
+    // (Windows `RUNNER~1`) normalize before comparison.
     let recent =
         mark_export::recent::RecentDocuments::open(&fx._dir.path().join("library/recent.json"))
             .expect("recent file readable");
-    assert_eq!(recent.paths(), [fx.page_path.as_path()]);
+    assert_eq!(recent.paths(), [platform::canonicalize(&fx.page_path)]);
 
     // A fresh app on the same storage lists it in the empty workspace;
     // clicking the row opens the document.
@@ -908,7 +936,7 @@ fn window_title_tracks_dirty_state(cx: &mut TestAppContext) {
 
     // Undo back to the save point clears it.
     with_window(&fx, cx, |window, cx| {
-        window.press("ctrl-z", cx);
+        window.press(&format!("{}-z", modifier()), cx);
     });
     with_window(&fx, cx, |window, cx| {
         window.render_frame(cx);
@@ -983,7 +1011,7 @@ fn quit_prompts_when_dirty_and_escape_cancels(cx: &mut TestAppContext) {
     // Ctrl+Q on a dirty document opens the dialog instead of quitting.
     with_window(&fx, cx, |window, cx| {
         window.render_frame(cx);
-        window.press("ctrl-q", cx);
+        window.press(&format!("{}-q", modifier()), cx);
     });
     assert!(fx.app.update(cx, |app, _| app.confirm_pending().is_some()));
 
@@ -1002,7 +1030,7 @@ fn quit_prompts_when_dirty_and_escape_cancels(cx: &mut TestAppContext) {
     // (a no-op in the test platform, but the dialog must resolve).
     with_window(&fx, cx, |window, cx| {
         window.render_frame(cx);
-        window.press("ctrl-q", cx);
+        window.press(&format!("{}-q", modifier()), cx);
     });
     with_window(&fx, cx, |window, cx| {
         window.render_frame(cx);

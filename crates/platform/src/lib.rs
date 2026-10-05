@@ -36,6 +36,35 @@ pub fn app_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// `std::fs::canonicalize` with the Windows verbatim prefix stripped.
+///
+/// Canonical paths are what gets persisted (the recents list): resolved
+/// symlinks survive `cwd` changes and 8.3 short names (`RUNNER~1`) become
+/// real ones. But on Windows `canonicalize` returns `\\?\`-prefixed
+/// verbatim paths — ugly in UI text and surprising to other tools — so
+/// the prefix comes off (`\\?\C:\…` → `C:\…`, `\\?\UNC\server\…` →
+/// `\\server\…`). A missing file returns the path as given.
+pub fn canonicalize(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => strip_windows_verbatim(canonical),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Removes the `\\?\` verbatim prefix from an absolute Windows path.
+fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path; // non-UTF-16-ish components: keep the verbatim form
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
+}
+
 /// Reveals a file in the platform file manager: macOS selects it in Finder
 /// (`open -R`), Windows opens the folder with it selected
 /// (`explorer /select,`), Linux opens the containing folder (`xdg-open`).
