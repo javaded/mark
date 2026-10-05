@@ -815,3 +815,252 @@ fn export_button_and_progress_surface_exist(cx: &mut TestAppContext) {
         assert!(window.try_find("mark-export-status").is_some());
     });
 }
+
+// ----- Phase 10: recents, dirty state, discard dialog, toasts (plan.md §16, §18) --
+
+/// A second app sharing `fx`'s storage roots, in its own window.
+fn second_app_sharing(fx: &Fixture, cx: &mut TestAppContext) -> Fixture {
+    let root = fx._dir.path().join("library");
+    let pdf = Arc::new(mark_pdf::PdfWorker::spawn());
+    let (window, app) = cx
+        .update(|cx| {
+            gpui_kit::open_window(test_window_options(), cx, |window, cx| {
+                let app = cx.new(|cx| MarkApp::with_library_root(pdf, root, cx));
+                window.focus(&app.read(cx).focus_handle().clone(), cx);
+                app
+            })
+        })
+        .expect("open second test window");
+    Fixture {
+        window,
+        app,
+        asset_id: fx.asset_id,
+        stamp_id: fx.stamp_id,
+        page_path: fx.page_path.clone(),
+        _dir: tempfile::TempDir::new().expect("placeholder dir (outlives nothing)"),
+    }
+}
+
+#[gpui_kit::test]
+fn recent_documents_persist_list_and_reopen(cx: &mut TestAppContext) {
+    let fx = fixture(cx); // opens page.png through the production path
+    cx.run_until_parked();
+
+    // The list persisted (plan.md §18), most recent first.
+    let recent =
+        mark_export::recent::RecentDocuments::open(&fx._dir.path().join("library/recent.json"))
+            .expect("recent file readable");
+    assert_eq!(recent.paths(), [fx.page_path.as_path()]);
+
+    // A fresh app on the same storage lists it in the empty workspace;
+    // clicking the row opens the document.
+    let second = second_app_sharing(&fx, cx);
+    with_window(&second, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("mark-recent-row", 0usize)).is_some());
+        window.click(("mark-recent-row", 0usize), cx);
+    });
+    cx.run_until_parked();
+    let source = second.app.update(cx, |app, _| {
+        app.opened_document()
+            .expect("document reopened from the recent list")
+            .session()
+            .source()
+            .path()
+            .to_path_buf()
+    });
+    assert_eq!(source, fx.page_path);
+
+    // Gone from disk → gone from the list (convenience data only).
+    let missing = second._dir.path().join("gone.pdf");
+    std::fs::write(&missing, b"stub").expect("write stub");
+    let mut list = mark_export::recent::RecentDocuments::default();
+    list.record(&missing);
+    list.record(&fx.page_path);
+    list.save(&fx._dir.path().join("library/recent.json"))
+        .expect("save");
+    std::fs::remove_file(&missing).expect("remove");
+    let third = second_app_sharing(&second, cx);
+    with_window(&third, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("mark-recent-row", 1usize)).is_none(),
+            "missing files are not listed"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn window_title_tracks_dirty_state(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+    });
+    let clean = fx.app.update(cx, |app, _| app.title_text().to_owned());
+    assert_eq!(clean, "page.png");
+
+    let _ = place_signature(&fx, cx);
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+    });
+    let dirty = fx.app.update(cx, |app, _| app.title_text().to_owned());
+    assert_eq!(dirty, "page.png *", "dirty marker (plan.md §16)");
+
+    // Undo back to the save point clears it.
+    with_window(&fx, cx, |window, cx| {
+        window.press("ctrl-z", cx);
+    });
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+    });
+    let undone = fx.app.update(cx, |app, _| app.title_text().to_owned());
+    assert_eq!(undone, "page.png");
+
+    // And a successful export marks the session saved.
+    let _ = place_signature(&fx, cx);
+    fx.app.update(cx, |app, cx| {
+        app.export_to(fx._dir.path().join("page-signed.png"), cx)
+    });
+    cx.run_until_parked();
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+    });
+    let exported = fx.app.update(cx, |app, _| app.title_text().to_owned());
+    assert_eq!(exported, "page.png");
+}
+
+#[gpui_kit::test]
+fn discard_dialog_guards_opening_over_a_dirty_document(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+    let _ = place_signature(&fx, cx); // dirty
+
+    let other = fx._dir.path().join("other.png");
+    write_png(&other, 320, 240, [10, 10, 10, 255]);
+
+    // Opening another document while dirty prompts instead of replacing.
+    fx.app
+        .update(cx, |app, cx| app.open_document_unfocused(other.clone(), cx));
+    assert!(fx.app.update(cx, |app, _| app.confirm_pending().is_some()));
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-confirm-cancel").is_some());
+        assert!(window.try_find("mark-confirm-discard").is_some());
+        assert!(window.try_find("mark-confirm-export").is_some());
+        window.click("mark-confirm-cancel", cx);
+    });
+    // Cancel: the dirty document is untouched.
+    let still = fx.app.update(cx, |app, _| {
+        app.confirm_pending().is_none()
+            && app.opened_document().unwrap().session().is_dirty()
+            && app.opened_document().unwrap().session().source().path() == fx.page_path
+    });
+    assert!(still, "cancel keeps the dirty document");
+
+    // Discard: the blocked open proceeds.
+    fx.app
+        .update(cx, |app, cx| app.open_document_unfocused(other.clone(), cx));
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click("mark-confirm-discard", cx);
+    });
+    cx.run_until_parked();
+    let opened = fx.app.update(cx, |app, _| {
+        app.opened_document()
+            .unwrap()
+            .session()
+            .source()
+            .path()
+            .to_path_buf()
+    });
+    assert_eq!(opened, other);
+}
+
+#[gpui_kit::test]
+fn quit_prompts_when_dirty_and_escape_cancels(cx: &mut TestAppContext) {
+    let fx = fixture(cx);
+    let _ = place_signature(&fx, cx);
+
+    // Ctrl+Q on a dirty document opens the dialog instead of quitting.
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.press("ctrl-q", cx);
+    });
+    assert!(fx.app.update(cx, |app, _| app.confirm_pending().is_some()));
+
+    // Escape dismisses the dialog as a cancel (the app stays open, the
+    // document keeps its changes).
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.press("escape", cx);
+    });
+    let cancelled = fx.app.update(cx, |app, _| {
+        app.confirm_pending().is_none() && app.opened_document().unwrap().session().is_dirty()
+    });
+    assert!(cancelled, "escape cancels the quit prompt");
+
+    // A clean quit goes straight through: discard → the pending Quit runs
+    // (a no-op in the test platform, but the dialog must resolve).
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.press("ctrl-q", cx);
+    });
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        window.click("mark-confirm-discard", cx);
+    });
+    assert!(fx.app.update(cx, |app, _| app.confirm_pending().is_none()));
+}
+
+#[gpui_kit::test]
+fn duplicate_to_page_and_export_announce_through_toasts(cx: &mut TestAppContext) {
+    // Two pages, driven directly: the toast is the only visible feedback
+    // for a copy that lands off-screen (the Phase 8 open point).
+    let fx = seeded(cx);
+    let document = Document::new(
+        DocumentSource::Image {
+            path: fx.page_path.clone(),
+        },
+        vec![Page::new(400., 300.), Page::new(400., 300.)],
+    );
+    fx.app
+        .update(cx, |app, cx| app.open_test_document(document, cx));
+    cx.run_until_parked();
+    let (id, _) = place_signature(&fx, cx);
+
+    fx.app.update(cx, |app, cx| app.duplicate_to_page(1, cx));
+    let messages = fx.app.update(cx, |app, _| app.toast_messages());
+    assert!(
+        messages.iter().any(|m| m == "Duplicated to page 2"),
+        "toast says where the copy landed: {messages:?}"
+    );
+    assert_eq!(
+        fx.app.update(cx, |app, _| app
+            .opened_document()
+            .unwrap()
+            .session()
+            .document()
+            .pages()[1]
+            .objects()
+            .len()),
+        1
+    );
+    let _ = id;
+
+    with_window(&fx, cx, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mark-toast-area").is_some());
+    });
+
+    // Export completion announces too (the status bar keeps the detail).
+    fx.app.update(cx, |app, cx| {
+        app.export_to(fx._dir.path().join("page-signed.png"), cx)
+    });
+    cx.run_until_parked();
+    let messages = fx.app.update(cx, |app, _| app.toast_messages());
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Exported ") && m.ends_with("page-signed.png")),
+        "export toast: {messages:?}"
+    );
+}

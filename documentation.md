@@ -29,6 +29,45 @@ This is the living development log for the Mark project. Every agent (AI or huma
 
 ## Entries
 
+### 2026-10-05 — Phase 10 complete: persistence and polish — dirty state, discard dialog, recents, toasts; icon-catalog fix
+
+**Context:**
+
+Phase 10 of `plan.md` §24 (§16, §18): dirty state in the window title, close/open-over-dirty confirmation (Export… / Discard / Cancel), recent files, error surfaces, toasts (delivering the "duplicated to page N" feedback left open in Phase 8 and the Phase 9 "Next" toast point). The previous session froze mid-implementation; this session recovered the tree, finished verification, and fixed a silent missing-icon defect the new logging exposed.
+
+**Actions:**
+
+- Recovered the frozen working tree: `mark-export/src/recent.rs` (new), `app_config_dir` in `platform`, and the `app.rs`/`main.rs`/`ui_tests.rs` changes were all present and compiling; the remaining work was formatting, two clippy errors in the new tests (`cloned_ref_to_slice_refs`, `op_ref`), and verification.
+- `mark-export recent.rs`: `RecentDocuments` — bounded (10), most-recent-first, versioned JSON in the platform app-config directory, atomic save (tmp+rename). A missing file is empty; a damaged file errors but the app degrades to a fresh list (recents are derived convenience data, unlike user-created library assets). 4 unit tests: missing→empty, record orders/dedupes/truncates, save/reopen round-trip, damaged-file replacement.
+- `platform`: `app_config_dir()` — `~/.config/mark` on Linux, Application Support on macOS (folded like the data dir), `%APPDATA%\mark` on Windows; `None` degrades to in-memory only.
+- App recents: recorded on every successful open (image and PDF alike) with `fs::canonicalize` first (a relative CLI argument must still open from the next launch's cwd — verified against entries recorded before the fix, which were cwd-relative), persisted off the UI thread (failed write logs a warn, in-memory list stands). The empty workspace lists the top 5 that still exist on disk (`is_file` filter), file name + dimmed directory per row, click → `open_document` through the same dirty guard as every other open.
+- Dirty state (§16): window title `<name>` / `<name> *`, synced opportunistically in `render` (every dirty transition notifies; the platform `set_window_title` call itself is change-guarded), "Mark" when empty.
+- Close confirmation (§16): `PendingAction` (Open/Quit). The discard dialog (gpui-omarchy `alert_dialog` + `dialog_popup`) offers Cancel / Discard (Danger) / Export… (Primary) and takes focus while open; Escape cancels through the app-scope fallback for the async file-dialog path where focus can't be taken. Ctrl+Q, window close (`on_window_should_close` in `main.rs`), and opening another document all route through the same guard. Export… closes the dialog and runs the export flow with the pending action parked in `resume_after_export`: success runs it, a failed or save-dialog-cancelled export drops it (the document stays open, the user decides again).
+- Toasts (§10, §17): `ToastManager` with sonner motion, 4 s auto-dismiss, one 200 ms timer task while any toast is mounted, bottom-right stack over the canvas. "Exported \<name\>" on export success (status bar keeps the detail) and "Duplicated to page N" on the Phase 8 off-screen copy.
+- Structured logging (§17): `tracing_subscriber` at INFO in `main`; opens, exports, and duplicate-to-page log counts/outcomes only, never contents. PDF load failures — previously swallowed into the Failed state silently — now `warn` with the error and path (this immediately paid off in verification, below).
+- **Icon-catalog fix**: the tracing subscriber bridges GPUI's `log` errors, exposing that `signature`, `stamp`, `chevrons-left/right`, `zoom-in/out`, and `file-x` icons have silently rendered as nothing since their phases — `gpui_kit::assets::Assets` is a curated subset that doesn't include them. Switched `.with_assets` to `AllAssets` (the embedded full Lucide catalog); zero missing-asset errors after.
+- UI tests (5 new): recents persist + relist in a second app + reopen by row click + missing files filtered; title tracks dirty through place/undo/export; discard dialog guards opening over a dirty document (cancel keeps it, discard proceeds); quit prompts when dirty and Escape cancels, then Discard resolves; duplicate-to-page and export announce through toasts (+ toast area mounts).
+
+**Decisions:**
+
+- Recents degrade silently on damage where the library surfaces a notice: nothing user-created can be lost, and the next open overwrites the damage (asserted by test).
+- Canonicalize at record time rather than display time: the stored list is then self-contained and the `is_file` filter and reopens work from any cwd.
+- The dialog's Escape handling doubles as the async-path fallback: focus is taken when a window is in hand (quit, window close, recent-row click) and Escape covers the file-dialog return, which has none.
+- `AllAssets` over the curated `Assets` subset: Mark uses Lucide glyphs outside gpui-kit's own component set; a curated list that silently drops them is a trap (this defect survived three phases of pixel verification because empty icons classify as background).
+- The suspected "flaky PDF open" during verification was a false alarm: the failing runs passed a nonexistent relative path (`letter-portrait.pdf` at cwd) and the Failed state was correct — the actual gap was that the failure was invisible in logs, which the new `warn` closes. Lesson: check the path before blaming the loader.
+- Toast lifecycle lives in one clock task, restarted on demand by `push_toast`, rather than per-toast timers: one spawn/despawn seam, and `advance` already handles expiry ordering.
+
+**Verification:**
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` — OK.
+- `cargo test --workspace --all-targets` — 119 passed (4 recent + 5 UI new), 0 failed.
+- Native (Omarchy): `mark resources/test-documents/mixed-sizes.pdf` → exit 124 (alive at kill); hyprctl shows the window titled `mixed-sizes.pdf` (§16 title verified natively, clean state, no marker); screenshot pixel-classification over the window rect: header band 22, thumbnails 10, canvas 21, assets panel 18 distinct quantized colors — all regions populated. Empty launch: window titled `Mark`, empty workspace renders the Recent list (center-lower band 44 distinct colors across rows/paths); `recent.json` on disk holds the canonicalized path. Failure run (`mark /nonexistent.pdf`): Failed workspace with the now-rendering file-x icon, zero missing-asset errors, `could not load the PDF` warn with path. The portal save dialog and live toast dismissal timing remain manual checks (same caveat class as Phases 3–5); the flows are covered headlessly.
+
+**Next:**
+
+1. Phase 11 — cross-platform hardening: compile and run on macOS and Windows (§20.5 domain-CI set already exists; validate `app_config_dir`/`app_data_dir` per platform and PDFium bundling).
+2. Consider "open folder" affordance on the export toast during Phase 11 polish (Phase 9's Next point, now unblocked by the toast surface).
+
 ### 2026-10-05 — Phase 9 complete: PDF export — real image page objects, PNG composition, progress UI
 
 **Context:**

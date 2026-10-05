@@ -10,15 +10,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
+use gpui_kit::base::{
+    AlertDialogAction, AlertDialogCancel, ToastManager, ToastMotion, ToastOptions,
+};
 use gpui_kit::{
     AnyElement, ClickEvent, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, TestSupportExt as _, Window, div, rems,
+    MouseButton, MouseDownEvent, ParentElement as _, Render, SharedString, Styled as _, Task,
+    TestSupportExt as _, Window, div, rems,
 };
 use gpui_omarchy::{
-    ActiveTheme, ButtonVariant, IconName, MenuItem, Theme, button, focus_scope, icon, icon_button,
-    menu, with_tooltip,
+    ActiveTheme, ButtonVariant, IconName, MenuItem, Theme, button, dialog_button,
+    dialog_description, dialog_popup, dialog_title, focus_scope, icon, icon_button, menu,
+    with_tooltip,
 };
 use mark_core::{
     AddObject, AssetId, AssetKind, DeleteObject, DocumentObject, DocumentSession, DuplicateObject,
@@ -26,6 +32,7 @@ use mark_core::{
 };
 use mark_export::export::{PngOverlay, compose_png_page, signed_destination};
 use mark_export::library::AssetLibrary;
+use mark_export::recent::RecentDocuments;
 use mark_pdf::{ImageOverlay, PdfDocumentHandle, PdfExport, PdfWorker, RenderedPage};
 
 use crate::assets;
@@ -36,8 +43,9 @@ use crate::{
     ClearSelection as ClearSelectionAction, Copy as CopyAction,
     DeleteSelected as DeleteSelectedAction, Duplicate as DuplicateAction, Export as ExportAction,
     FirstPage as FirstPageAction, LastPage as LastPageAction, NextPage as NextPageAction,
-    OpenDocument, Paste as PasteAction, PreviousPage as PreviousPageAction, Redo as RedoAction,
-    Undo as UndoAction, ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction, ZoomOut as ZoomOutAction,
+    OpenDocument, Paste as PasteAction, PreviousPage as PreviousPageAction, Quit as QuitAction,
+    Redo as RedoAction, Undo as UndoAction, ZoomFit as ZoomFitAction, ZoomIn as ZoomInAction,
+    ZoomOut as ZoomOutAction,
 };
 
 /// How far a duplicate or the first paste lands from its source, in page
@@ -69,6 +77,53 @@ pub(crate) enum ExportStatus {
     },
     Failed(SharedString),
 }
+
+/// What runs once the user resolves the discard-changes dialog
+/// (plan.md §16: closing a dirty document prompts Export… / Discard /
+/// Cancel).
+#[derive(Clone, Debug)]
+pub(crate) enum PendingAction {
+    /// Opens another document, dropping the dirty one.
+    Open(PathBuf),
+    /// Quits the application (window close and Ctrl+Q alike: single-window
+    /// app — closing the window ends the process).
+    Quit,
+}
+
+/// One transient toast notice (plan.md §10, §17): asynchronous status that
+/// requires no decision.
+#[derive(Clone, Debug)]
+struct ToastNotice {
+    message: SharedString,
+    kind: ToastKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ToastKind {
+    Success,
+    Info,
+}
+
+impl ToastKind {
+    fn icon(self) -> IconName {
+        match self {
+            Self::Success => IconName::Check,
+            Self::Info => IconName::Info,
+        }
+    }
+
+    fn color(self, theme: &Theme) -> gpui_kit::Hsla {
+        match self {
+            Self::Success => theme.accent,
+            Self::Info => theme.secondary,
+        }
+    }
+}
+
+/// How long a toast stays on screen before dismissing itself.
+const TOAST_TIMEOUT: Duration = Duration::from_secs(4);
+/// The toast lifecycle clock's tick.
+const TOAST_TICK: Duration = Duration::from_millis(200);
 
 /// Everything needed to display an opened document.
 ///
@@ -134,6 +189,28 @@ pub struct MarkApp {
     paste_count: u32,
     /// Export feedback: progress while a job runs, then the outcome.
     export: Option<ExportStatus>,
+    /// The action waiting on the discard-changes dialog (plan.md §16).
+    confirm: Option<PendingAction>,
+    /// The pending action to resume after an export triggered from the
+    /// discard dialog completes.
+    resume_after_export: Option<PendingAction>,
+    /// Focus for the discard-changes dialog (focused while open, returns
+    /// to the app scope on close).
+    confirm_focus: FocusHandle,
+    /// Recently opened documents (plan.md §18), persisted as JSON in the
+    /// app config directory.
+    recent: RecentDocuments,
+    /// Where `recent` persists; `None` degrades to in-memory only.
+    recent_path: Option<PathBuf>,
+    /// Transient notices, newest last (plan.md §10).
+    toasts: ToastManager<u64, ToastNotice>,
+    /// Keeps `toasts` advancing while any is mounted; `None` when idle.
+    toast_clock: Option<Task<()>>,
+    next_toast_id: u64,
+    /// The window title as last pushed to the platform: titles are synced
+    /// opportunistically in `render` (every mutation notifies), but the
+    /// platform call is made only on change.
+    window_title: String,
     /// Keyboard focus for the whole app: actions (navigation, zoom, open)
     /// dispatch through the focused node.
     focus_handle: FocusHandle,
@@ -143,17 +220,37 @@ impl MarkApp {
     pub fn new(pdf: Arc<PdfWorker>, cx: &mut Context<Self>) -> Self {
         let root = platform::app_data_dir()
             .unwrap_or_else(|| std::env::temp_dir().join("mark-library-fallback"));
-        Self::with_library_root(pdf, root, cx)
+        let recent_path = platform::app_config_dir().map(|dir| dir.join("recent.json"));
+        Self::with_storage(pdf, root, recent_path, cx)
     }
 
-    /// Constructor with the library root injected: production uses the
-    /// platform app-data directory; tests use a throwaway directory.
+    /// Constructor with the library root injected: tests use a throwaway
+    /// directory (recents ride beside the library for per-test isolation).
+    #[cfg(test)]
     pub(crate) fn with_library_root(
         pdf: Arc<PdfWorker>,
         root: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (library, notice) = Self::open_library(&root);
+        let recent_path = root.join("recent.json");
+        Self::with_storage(pdf, root, Some(recent_path), cx)
+    }
+
+    /// Constructor with both persistence locations injected.
+    pub(crate) fn with_storage(
+        pdf: Arc<PdfWorker>,
+        library_root: PathBuf,
+        recent_path: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (library, notice) = Self::open_library(&library_root);
+        // Recents are derived convenience data, not user assets: a damaged
+        // file degrades to an empty list without a notice (the next open
+        // overwrites it) — unlike the library, which surfaces its damage.
+        let recent = recent_path
+            .as_deref()
+            .and_then(|path| RecentDocuments::open(path).ok())
+            .unwrap_or_default();
         let mut app = Self {
             open: OpenState::Empty,
             pdf,
@@ -163,6 +260,15 @@ impl MarkApp {
             clipboard: None,
             paste_count: 0,
             export: None,
+            confirm: None,
+            resume_after_export: None,
+            confirm_focus: cx.focus_handle(),
+            recent,
+            recent_path,
+            toasts: ToastManager::new(ToastMotion::sonner()),
+            toast_clock: None,
+            next_toast_id: 0,
+            window_title: String::new(),
             focus_handle: cx.focus_handle(),
         };
         app.load_asset_images(cx);
@@ -267,7 +373,140 @@ impl MarkApp {
             let Some(path) = platform::FilePicker::pick_open_document(&dialogs).await else {
                 return;
             };
-            this.update(cx, |app, cx| app.open_path(path, cx)).ok();
+            this.update(cx, |app, cx| app.open_document_unfocused(path, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Opens `path` as a document, guarding a dirty document first:
+    /// dropping unexported placements is a decision the user makes in the
+    /// discard dialog, not a side effect of opening something else
+    /// (plan.md §16). The dialog takes the keyboard.
+    pub(crate) fn open_document(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.request_open(path, cx) {
+            self.confirm_focus.focus(window, cx);
+        }
+    }
+
+    /// [`Self::open_document`] for callers without a window (the file
+    /// dialog's async return): the dialog is mouse-operable, and Escape
+    /// still cancels it through the app-scope fallback.
+    pub(crate) fn open_document_unfocused(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.request_open(path, cx);
+    }
+
+    /// The shared dirty guard: `true` when the discard dialog opened.
+    fn request_open(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        if self.is_dirty() {
+            self.confirm = Some(PendingAction::Open(path));
+            cx.notify();
+            true
+        } else {
+            self.open_path(path, cx);
+            false
+        }
+    }
+
+    /// Ctrl+Q / window close: quits immediately when clean, otherwise the
+    /// discard dialog decides (plan.md §16).
+    pub(crate) fn handle_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dirty() {
+            self.confirm = Some(PendingAction::Quit);
+            self.confirm_focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        cx.quit();
+    }
+
+    /// Whether the open document has unexported changes.
+    fn is_dirty(&self) -> bool {
+        match &self.open {
+            OpenState::Opened(opened) => opened.session.is_dirty(),
+            _ => false,
+        }
+    }
+
+    /// Cancel: keep the document exactly as it is.
+    fn cancel_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.confirm.take().is_some() {
+            Self::reclaim_focus(self, window, cx);
+            cx.notify();
+        }
+        true
+    }
+
+    /// Discard: drop the changes and run the action they were blocking.
+    fn discard_and_continue(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(pending) = self.confirm.take() {
+            Self::reclaim_focus(self, window, cx);
+            self.perform_pending(pending, cx);
+            cx.notify();
+        }
+        true
+    }
+
+    /// Export…: close the dialog and run the export flow; the pending
+    /// action resumes when the export completes. Cancelling the export
+    /// dialog or a failed export leaves the document open and clean of
+    /// prompts — the user retries whatever they were doing.
+    fn export_then_continue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.confirm.take() {
+            Self::reclaim_focus(self, window, cx);
+            self.resume_after_export = Some(pending);
+            cx.notify();
+            self.handle_export(window, cx);
+        }
+    }
+
+    /// Runs an action that was waiting on the discard dialog.
+    fn perform_pending(&mut self, pending: PendingAction, cx: &mut Context<Self>) {
+        match pending {
+            PendingAction::Open(path) => self.open_path(path, cx),
+            PendingAction::Quit => cx.quit(),
+        }
+    }
+
+    /// The window-close hook: `true` lets the window close.
+    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.is_dirty() {
+            self.confirm = Some(PendingAction::Quit);
+            self.confirm_focus.focus(window, cx);
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Records a successfully opened document in the recents list and
+    /// persists a snapshot of it off the UI thread (plan.md §18). A failed
+    /// write only loses convenience data; the in-memory list stands.
+    /// Paths are canonicalized so a relative CLI argument still opens from
+    /// whatever directory the next launch uses.
+    fn record_recent(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent.record(&canonical);
+        let Some(file) = self.recent_path.clone() else {
+            return;
+        };
+        let snapshot = self.recent.clone();
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move { snapshot.save(&file) })
+                .await;
+            if saved.is_err() {
+                this.update(cx, |_, _| {
+                    tracing::warn!("the recent documents list could not be saved");
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -354,8 +593,14 @@ impl MarkApp {
     }
 
     /// Escape: cancels any in-progress gesture, then clears the object
-    /// selection (plan.md §15).
+    /// selection (plan.md §15). An open discard dialog outranks both —
+    /// this is the fallback for when it could not take focus (opened from
+    /// the async file-dialog return).
     fn handle_clear_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm.is_some() {
+            self.cancel_confirm(window, cx);
+            return;
+        }
         let mut changed = false;
         if let OpenState::Opened(opened) = &mut self.open {
             changed = opened.gesture.take().is_some();
@@ -627,6 +872,14 @@ impl MarkApp {
             opened
                 .session
                 .execute(Box::new(DuplicateToPage::new(object, target.id())));
+            // The copy is invisible from the current page: say where it
+            // landed (the Phase 8 open point).
+            self.push_toast(
+                format!("Duplicated to page {}", page_index + 1),
+                ToastKind::Info,
+                cx,
+            );
+            tracing::info!(page = page_index + 1, "Duplicated to page");
             cx.notify();
         }
     }
@@ -715,9 +968,12 @@ impl MarkApp {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            // The loader consumes its own copy; `path` stays for the
+            // recents record on success.
+            let load_path = path.clone();
             let loaded = cx
                 .background_executor()
-                .spawn(async move { mark_image::ImageDocument::load(&path) })
+                .spawn(async move { mark_image::ImageDocument::load(&load_path) })
                 .await;
             this.update(cx, |app, cx| {
                 app.open = match loaded {
@@ -734,6 +990,8 @@ impl MarkApp {
                             rgba.width(),
                             Arc::new(canvas::render_image(&rgba)),
                         );
+                        tracing::info!(pages = document.page_count(), "Opened image document");
+                        app.record_recent(&path, cx);
                         OpenState::Opened(Box::new(OpenedDocument {
                             session: DocumentSession::new(document),
                             pdf: None,
@@ -765,8 +1023,20 @@ impl MarkApp {
             // Load: document metadata plus the worker-side handle. The app
             // only distinguishes success from failure here; friendly error
             // copy arrives with the error surfaces (Phase 10, plan.md §17).
-            let loaded: Option<mark_pdf::LoadedPdf> =
-                worker.load(path).await.ok().and_then(|result| result.ok());
+            let loaded: Option<mark_pdf::LoadedPdf> = worker
+                .load(path.clone())
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "the PDF worker became unavailable");
+                })
+                .ok()
+                .and_then(|result| {
+                    result
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, path = %path.display(), "could not load the PDF");
+                        })
+                        .ok()
+                });
 
             this.update(cx, |app, cx| {
                 match loaded {
@@ -777,6 +1047,8 @@ impl MarkApp {
                             .iter()
                             .map(|geometry| geometry.display_size())
                             .collect();
+                        tracing::info!(pages = loaded.document.page_count(), "Opened PDF document");
+                        app.record_recent(&path, cx);
                         app.open = OpenState::Opened(Box::new(OpenedDocument {
                             session: DocumentSession::new(loaded.document),
                             pdf: Some(handle),
@@ -1029,10 +1301,15 @@ impl MarkApp {
         let dialogs = platform::NativeFileDialogs;
         cx.spawn(async move |this, cx| {
             // Cancelled dialog = cancelled export; nothing was set yet.
+            // A pending discard-dialog action will not resume — the user
+            // cancelled their way out of that decision.
             if let Some(destination) =
                 platform::FilePicker::pick_save_export(&dialogs, default).await
             {
                 this.update(cx, |app, cx| app.export_to(destination, cx))
+                    .ok();
+            } else {
+                this.update(cx, |app, _| app.resume_after_export = None)
                     .ok();
             }
         })
@@ -1192,8 +1469,8 @@ impl MarkApp {
     }
 
     /// The export finished: record the outcome and mark the originating
-    /// session saved — dirty-state surfaces arrive in Phase 10, but the
-    /// session bookkeeping starts here.
+    /// session saved (plan.md §16 dirty state) — and resume whatever the
+    /// export was blocking, when it came from the discard dialog.
     fn finish_export(
         &mut self,
         outcome: Result<(), &str>,
@@ -1211,9 +1488,17 @@ impl MarkApp {
                     opened.session.mark_saved();
                 }
                 let name: SharedString = file_name(&destination).into();
+                tracing::info!(destination = %name, "Export completed");
+                self.push_toast(format!("Exported {name}"), ToastKind::Success, cx);
                 self.export = Some(ExportStatus::Done { name });
+                if let Some(pending) = self.resume_after_export.take() {
+                    self.perform_pending(pending, cx);
+                }
             }
             Err(message) => {
+                // The pending action stays un-run: the document is still
+                // there, the user decides again.
+                self.resume_after_export = None;
                 self.export = Some(ExportStatus::Failed(message.into()));
             }
         }
@@ -1222,6 +1507,88 @@ impl MarkApp {
 
     fn is_exporting(&self) -> bool {
         matches!(self.export, Some(ExportStatus::Running { .. }))
+    }
+
+    // ----- toasts (plan.md §10, §17) ---------------------------------------------
+
+    /// Shows a transient notice; auto-dismisses after [`TOAST_TIMEOUT`].
+    fn push_toast(
+        &mut self,
+        message: impl Into<SharedString>,
+        kind: ToastKind,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push(
+            id,
+            ToastNotice {
+                message: message.into(),
+                kind,
+            },
+            ToastOptions {
+                timeout: Some(TOAST_TIMEOUT),
+            },
+            Instant::now(),
+        );
+        if self.toast_clock.is_none() {
+            self.toast_clock = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(TOAST_TICK).await;
+                    let Ok(continue_clock) = this.update(cx, |app, cx| {
+                        let advance = app.toasts.advance(Instant::now(), false);
+                        if advance.changed {
+                            cx.notify();
+                        }
+                        !app.toasts.is_empty()
+                    }) else {
+                        break;
+                    };
+                    if !continue_clock {
+                        break;
+                    }
+                }
+                // The clock restarts on the next push.
+                this.update(cx, |app, _| app.toast_clock = None).ok();
+            }));
+        }
+        cx.notify();
+    }
+
+    // ----- window title (plan.md §16) ---------------------------------------------
+
+    /// The title text for the current state: the open document's name with
+    /// a `*` marker while it has unexported changes, else the app name.
+    fn window_title_text(&self) -> String {
+        match &self.open {
+            OpenState::Opened(opened) => {
+                let name = opened
+                    .session()
+                    .source()
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Document");
+                if opened.session.is_dirty() {
+                    format!("{name} *")
+                } else {
+                    name.to_owned()
+                }
+            }
+            _ => "Mark".to_owned(),
+        }
+    }
+
+    /// Pushes the title to the platform when it changed. Called from
+    /// `render`: every dirty-state transition notifies (commands, undo,
+    /// redo, export), so the next frame is always the right moment, and
+    /// the platform call itself is change-guarded.
+    fn sync_window_title(&mut self, window: &mut Window) {
+        let title = self.window_title_text();
+        if title != self.window_title {
+            self.window_title = title;
+            window.set_window_title(&self.window_title);
+        }
     }
 
     /// The open document's source path, if any.
@@ -1236,6 +1603,29 @@ impl MarkApp {
     #[cfg(test)]
     pub(crate) fn export_status(&self) -> Option<&ExportStatus> {
         self.export.as_ref()
+    }
+
+    /// Mounted toast messages, oldest first (test observation).
+    #[cfg(test)]
+    pub(crate) fn toast_messages(&self) -> Vec<String> {
+        self.toasts
+            .iter()
+            .map(|(_, notice, _)| notice.message.to_string())
+            .collect()
+    }
+
+    /// The pending action shown in the discard dialog, if any (test
+    /// observation).
+    #[cfg(test)]
+    pub(crate) fn confirm_pending(&self) -> Option<&PendingAction> {
+        self.confirm.as_ref()
+    }
+
+    /// The computed window title (test observation; the platform title is
+    /// not readable back in headless tests).
+    #[cfg(test)]
+    pub(crate) fn title_text(&self) -> &str {
+        &self.window_title
     }
 
     fn header_title(&self) -> Option<&str> {
@@ -1385,6 +1775,7 @@ fn file_name(path: &Path) -> &str {
 impl Render for MarkApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.omarchy().clone();
+        self.sync_window_title(window);
         let zoom_percent = match &self.open {
             OpenState::Opened(opened) => opened.viewer.zoom_percent(),
             _ => None,
@@ -1399,11 +1790,33 @@ impl Render for MarkApp {
         let can_export = matches!(self.open, OpenState::Opened(_));
         let exporting = self.is_exporting();
         let export_status = self.export.clone();
+        // Recents ride beside the empty workspace only: with a document
+        // open the list is unreachable (and unneeded).
+        let recent: Vec<PathBuf> = if matches!(self.open, OpenState::Empty) {
+            self.recent
+                .paths()
+                .iter()
+                .filter(|path| path.is_file())
+                .take(5)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let confirm = self.confirm.is_some();
+        let toasts: Vec<(u64, ToastNotice)> = self
+            .toasts
+            .iter()
+            .map(|(id, notice, _)| (*id, notice.clone()))
+            .collect();
 
         focus_scope("mark")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &OpenDocument, _window, cx| {
                 this.open_with_dialog(cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuitAction, window, cx| {
+                this.handle_quit(window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &NextPageAction, _window, cx| this.handle_next_page(cx)),
@@ -1449,7 +1862,7 @@ impl Render for MarkApp {
                 cx,
             ))
             .child(match &mut self.open {
-                OpenState::Empty => empty_workspace(&theme, cx).into_any_element(),
+                OpenState::Empty => empty_workspace(&theme, &recent, cx).into_any_element(),
                 OpenState::Opening { name } => {
                     notice_workspace(&theme, IconName::FileText, format!("Opening {name}…"), None)
                         .into_any_element()
@@ -1476,7 +1889,116 @@ impl Render for MarkApp {
                 )),
                 _ => None,
             })
+            .children(confirm.then(|| {
+                discard_dialog(
+                    &theme,
+                    self.header_title().unwrap_or("the document"),
+                    &self.confirm_focus,
+                    cx,
+                )
+            }))
+            .children((!toasts.is_empty()).then(|| toast_area(&theme, &toasts, cx)))
     }
+}
+
+/// The discard-changes dialog (plan.md §16): Export… runs the export flow
+/// and resumes the blocked action on success, Discard drops the changes,
+/// Cancel keeps everything as it is. Escape cancels; the backdrop never
+/// dismisses an explicit decision.
+fn discard_dialog(
+    theme: &Theme,
+    name: &str,
+    focus: &FocusHandle,
+    cx: &mut Context<MarkApp>,
+) -> impl IntoElement {
+    let _ = theme;
+    // Base dialog handlers return a "handled" bool; `cx.listener` cannot
+    // produce one, so the entity update is explicit here.
+    let discard = cx.weak_entity();
+    let cancel = cx.weak_entity();
+    gpui_omarchy::alert_dialog(focus, cx)
+        .open(true)
+        .on_ok(move |_, window, cx| {
+            discard
+                .update(cx, |app, cx| app.discard_and_continue(window, cx))
+                .unwrap_or(true)
+        })
+        .on_cancel(move |_, window, cx| {
+            cancel
+                .update(cx, |app, cx| app.cancel_confirm(window, cx))
+                .unwrap_or(true)
+        })
+        .popup(
+            dialog_popup(cx)
+                .child(dialog_title("Discard changes?", cx))
+                .child(dialog_description(
+                    format!("“{name}” has placements that have not been exported yet."),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(rems(0.5))
+                        .child(AlertDialogCancel::new().child(dialog_button(
+                            "mark-confirm-cancel",
+                            "Cancel",
+                            ButtonVariant::Outline,
+                            cx,
+                        )))
+                        .child(AlertDialogAction::new().child(dialog_button(
+                            "mark-confirm-discard",
+                            "Discard",
+                            ButtonVariant::Danger,
+                            cx,
+                        )))
+                        .child(
+                            dialog_button(
+                                "mark-confirm-export",
+                                "Export…",
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.export_then_continue(window, cx),
+                            )),
+                        ),
+                ),
+        )
+}
+
+/// The toast stack, bottom-right (plan.md §10): asynchronous status that
+/// requires no decision.
+fn toast_area(
+    theme: &Theme,
+    toasts: &[(u64, ToastNotice)],
+    cx: &mut Context<MarkApp>,
+) -> impl IntoElement {
+    div()
+        .id("mark-toast-area")
+        .test_support()
+        .absolute()
+        .right(rems(0.875))
+        .bottom(rems(2.5))
+        .w(rems(20.))
+        .flex()
+        .flex_col()
+        .gap(rems(0.5))
+        .occlude()
+        .children(toasts.iter().map(|(id, notice)| {
+            gpui_omarchy::toast(format!("mark-toast-{id}"), cx).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.625))
+                    .child(
+                        icon(notice.kind.icon())
+                            .size(rems(1.))
+                            .text_color(notice.kind.color(theme)),
+                    )
+                    .child(div().child(notice.message.clone())),
+            )
+        }))
 }
 
 /// The document workspace: thumbnail sidebar, canvas stage with placed
@@ -1950,7 +2472,72 @@ fn status_bar(
         )
 }
 
-fn empty_workspace(theme: &Theme, cx: &mut Context<MarkApp>) -> impl IntoElement {
+fn empty_workspace(
+    theme: &Theme,
+    recent: &[PathBuf],
+    cx: &mut Context<MarkApp>,
+) -> impl IntoElement {
+    let recents_list = (!recent.is_empty()).then(|| {
+        div()
+            .id("mark-recent")
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(rems(0.25))
+            .w(rems(22.))
+            .child(
+                div()
+                    .text_size(rems(0.75))
+                    .text_color(theme.secondary)
+                    .child("Recent"),
+            )
+            .children(recent.iter().enumerate().map(|(index, path)| {
+                let path = path.clone();
+                let name: SharedString = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Document")
+                    .to_owned()
+                    .into();
+                let directory: SharedString = path
+                    .parent()
+                    .and_then(|parent| parent.to_str())
+                    .unwrap_or("")
+                    .to_owned()
+                    .into();
+                div()
+                    .id(("mark-recent-row", index))
+                    .test_support()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.125))
+                    .py(rems(0.375))
+                    .px(rems(0.5))
+                    .rounded_sm()
+                    .hover(|style| style.bg(theme.background))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            this.open_document(path.clone(), window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.875))
+                            .text_color(theme.foreground)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .truncate()
+                            .child(directory),
+                    )
+            }))
+    });
+
     div()
         .id("mark-workspace")
         .flex()
@@ -1988,7 +2575,8 @@ fn empty_workspace(theme: &Theme, cx: &mut Context<MarkApp>) -> impl IntoElement
                         .text_size(rems(0.75))
                         .text_color(theme.secondary)
                         .child(format!("or press {}", MarkApp::open_hint())),
-                ),
+                )
+                .children(recents_list),
         )
 }
 

@@ -3914,6 +3914,8 @@ dependencies = [
  "pdfium-render",
  "platform",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

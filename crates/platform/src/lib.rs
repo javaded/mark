@@ -21,6 +21,21 @@ pub fn app_data_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|dir| dir.join("mark"))
 }
 
+/// Mark's per-user application config directory (plan.md §18: recent
+/// documents and, later, settings).
+///
+/// Linux `~/.config/mark`, macOS `~/Library/Application Support/mark`,
+/// Windows `%APPDATA%\mark`. `None` when the platform has no discoverable
+/// config directory; callers degrade to keeping recents in memory only.
+pub fn app_config_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        // macOS folds config into Application Support, like the data dir.
+        app_data_dir()
+    } else {
+        dirs::config_dir().map(|dir| dir.join("mark"))
+    }
+}
+
 /// Source of native open/save dialogs (plan.md §9.1).
 pub trait FilePicker {
     /// Asks the user to pick one existing document.
